@@ -1,0 +1,18 @@
+# data and models - never commit these
+data/
+lines/
+papers/
+*.pt
+*.ckpt
+*.pth
+*.zip
+dataset.csv
+lines_index.csv
+alphabet.json
+
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+env/
