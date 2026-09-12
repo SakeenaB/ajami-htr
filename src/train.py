@@ -154,6 +154,14 @@ def main():
     p.add_argument("--resume", default=None, help="checkpoint to continue from")
     p.add_argument("--weighted", action="store_true",
                    help="sample Fulfulde and Hausa equally in expectation")
+    p.add_argument("--overfit", action="store_true",
+                   help="diagnostic: validate on the training lines themselves. "
+                        "A healthy model can drive a few dozen lines to near "
+                        "zero CER. If it cannot, the fault is in the model or "
+                        "the loss, not in the amount of data.")
+    p.add_argument("--no-schedule", action="store_true",
+                   help="hold the learning rate constant (use for short runs, "
+                        "where the milestones would otherwise fire immediately)")
     args = p.parse_args()
 
     out_dir = Path(args.out)
@@ -184,6 +192,15 @@ def main():
         val_ds.df = val_ds.df.head(max(20, args.limit // 4)).reset_index(drop=True)
         print(f"SMOKE TEST: {len(train_ds)} train, {len(val_ds)} val lines")
 
+    if args.overfit:
+        # Validate on the training lines. This is deliberately the one thing
+        # you must never do when measuring performance - and exactly the right
+        # thing when asking whether the model can learn at all.
+        val_ds.df = train_ds.df.copy()
+        print("OVERFIT DIAGNOSTIC: validating on the training lines. "
+              "CER should approach zero. If it plateaus high, the fault is "
+              "in the model or the loss, not the data.")
+
     print("train split:"); print(train_ds.report())
     print("val split:");   print(val_ds.report())
     print()
@@ -208,12 +225,17 @@ def main():
     optimiser = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # Step the learning rate down at 50% and 75% of training, as in the
-    # reference configuration.
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimiser,
-        milestones=[int(args.epochs * 0.5), int(args.epochs * 0.75)],
-        gamma=0.1,
-    )
+    # reference configuration. On a short run the milestones fire almost
+    # immediately and strangle learning, so --no-schedule disables them.
+    if args.no_schedule:
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimiser, milestones=[], gamma=1.0)
+    else:
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimiser,
+            milestones=[int(args.epochs * 0.5), int(args.epochs * 0.75)],
+            gamma=0.1,
+        )
 
     start_epoch, best_cer, bad_epochs = 1, float("inf"), 0
     history = []
