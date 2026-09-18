@@ -35,6 +35,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+import augment
 from alphabet import Alphabet, check_round_trip
 from crnn import CRNN, greedy_decode
 from dataset import AjamiLineDataset, make_loader
@@ -152,6 +153,17 @@ def main():
     p.add_argument("--eval-every", type=int, default=1)
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--resume", default=None, help="checkpoint to continue from")
+    p.add_argument("--augment", default="combined",
+                   choices=["none", "geometric", "morphological",
+                            "photometric", "combined"],
+                   help="augmentation applied to the training split only. "
+                        "Without it a 7M-parameter model memorises 4,344 "
+                        "lines: training loss collapses while validation "
+                        "error stalls.")
+    p.add_argument("--amp", action="store_true",
+                   help="mixed precision - roughly halves epoch time on a "
+                        "modern GPU, which is what makes 700+ epochs fit "
+                        "inside a 12-hour session")
     p.add_argument("--weighted", action="store_true",
                    help="sample Fulfulde and Hausa equally in expectation")
     p.add_argument("--overfit", action="store_true",
@@ -182,10 +194,16 @@ def main():
     print()
 
     # ---- data -----------------------------------------------------------
+    # Augmentation is applied to the training split ONLY. Distorting the
+    # validation images would make the reported error a measure of the
+    # distortion rather than of the model.
+    transform = augment.get(args.augment, seed=0)
     train_ds = AjamiLineDataset(args.csv, args.images, alphabet,
-                                split="train", height=args.height)
+                                split="train", height=args.height,
+                                transform=transform)
     val_ds = AjamiLineDataset(args.csv, args.images, alphabet,
                               split="val", height=args.height)
+    print(f"augmentation: {args.augment}")
 
     if args.limit:
         train_ds.df = train_ds.df.head(args.limit).reset_index(drop=True)
@@ -240,6 +258,15 @@ def main():
     start_epoch, best_cer, bad_epochs = 1, float("inf"), 0
     history = []
 
+    # Mixed precision: most operations run in half precision, which roughly
+    # halves epoch time, while the scaler keeps gradients from underflowing.
+    # CTC itself is computed in full precision because its log-sum-exp is
+    # numerically delicate.
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if use_amp:
+        print("mixed precision enabled")
+
     if args.resume and Path(args.resume).exists():
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
@@ -263,7 +290,8 @@ def main():
             labels = batch["labels"].to(device)
             label_lengths = batch["label_lengths"].to(device)
 
-            log_probs = model(images)          # (time, batch, classes)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                log_probs = model(images)      # (time, batch, classes)
 
             # True output length per item. Using the padded width here would
             # tell CTC there is more room than the image really occupies.
@@ -272,14 +300,21 @@ def main():
                 dtype=torch.long, device=device,
             )
 
-            loss = criterion(log_probs, labels, input_lengths, label_lengths)
+            # CTC in float32 regardless of AMP: its log-sum-exp underflows in
+            # half precision and produces silent NaNs.
+            loss = criterion(log_probs.float(), labels,
+                             input_lengths, label_lengths)
 
             optimiser.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            # Unscale before clipping, or the threshold would apply to scaled
+            # gradients and have no consistent meaning.
+            scaler.unscale_(optimiser)
             # Recurrent networks are prone to exploding gradients; clipping
             # keeps a single bad batch from destabilising the whole run.
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimiser.step()
+            scaler.step(optimiser)
+            scaler.update()
 
             total_loss += loss.item()
             n_batches += 1
