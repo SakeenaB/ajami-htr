@@ -229,6 +229,22 @@ def main():
     val_loader = make_loader(val_ds, args.batch_size, shuffle=False,
                              num_workers=args.workers)
 
+    # A fixed sample of TRAINING lines, scored without augmentation at every
+    # evaluation. This is the diagnostic that separates the two ways a run can
+    # fail: if train CER is low while validation CER is high, the model is
+    # memorising; if both are high, it is not fitting at all (too much
+    # augmentation, too little capacity, or an input too small to show the
+    # marks). Without it, a flat validation curve could mean either.
+    train_probe_ds = AjamiLineDataset(args.csv, args.images, alphabet,
+                                      split="train", height=args.height)
+    if args.limit:
+        train_probe_ds.df = train_probe_ds.df.head(args.limit)
+    train_probe_ds.df = train_probe_ds.df.sample(
+        n=min(400, len(train_probe_ds.df)), random_state=0
+    ).reset_index(drop=True)
+    train_probe_loader = make_loader(train_probe_ds, args.batch_size,
+                                     shuffle=False, num_workers=args.workers)
+
     # ---- model ----------------------------------------------------------
     model = CRNN(n_classes=alphabet.size_with_blank,
                  input_height=args.height).to(device)
@@ -329,11 +345,14 @@ def main():
         # ---- validation --------------------------------------------------
         if epoch % args.eval_every == 0:
             val = evaluate(model, val_loader, alphabet, device)
-            line += (f"  |  val CER {val['cer']*100:6.2f}%  "
+            tr = evaluate(model, train_probe_loader, alphabet, device)
+            line += (f"  |  train CER {tr['cer']*100:6.2f}%"
+                     f"  |  val CER {val['cer']*100:6.2f}%  "
                      f"WER {val['wer']*100:6.2f}%  "
                      f"diacritic {val['diacritic_cer']*100:6.2f}%")
 
-            history.append({"epoch": epoch, "loss": train_loss, **{
+            history.append({"epoch": epoch, "loss": train_loss,
+                            "train_cer": tr["cer"], **{
                 k: v for k, v in val.items() if k != "samples"}})
 
             improved = val["cer"] < best_cer
