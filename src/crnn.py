@@ -124,6 +124,14 @@ class CRNN(nn.Module):
         # are concatenated at each step.
         self.classifier = nn.Linear(lstm_hidden * 2, n_classes)
 
+        # Auxiliary head (Al-azzawi et al., 2026): a second classifier placed
+        # directly on the convolutional features, before the LSTM. During
+        # training its CTC loss is added at a small weight, which gives the
+        # encoder a direct character-recognition signal rather than leaving
+        # it to be trained only through the recurrent layers. Not used at
+        # inference.
+        self.aux_classifier = nn.Linear(channels[2], n_classes)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -138,7 +146,8 @@ class CRNN(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x):
+    def encode(self, x):
+        """Image -> sequence of convolutional feature vectors, (time, batch, C)."""
         x = self.stem(x)
         x = self.stage1(x)
         x = self.stage2(x)
@@ -146,13 +155,24 @@ class CRNN(nn.Module):
 
         x = self.column_pool(x)            # (B, C, 1, W')
         x = x.squeeze(2)                   # (B, C, W')
-        x = x.permute(2, 0, 1)             # (W', B, C) = (time, batch, feature)
+        return x.permute(2, 0, 1)          # (W', B, C) = (time, batch, feature)
 
-        x, _ = self.rnn(x)
-        x = self.dropout(x)
-        x = self.classifier(x)
+    def forward(self, x):
+        """Inference path: main head only."""
+        feats = self.encode(x)
+        out, _ = self.rnn(feats)
+        out = self.dropout(out)
+        out = self.classifier(out)
+        return nn.functional.log_softmax(out, dim=2)
 
-        return nn.functional.log_softmax(x, dim=2)
+    def forward_with_aux(self, x):
+        """Training path: returns (main_log_probs, aux_log_probs)."""
+        feats = self.encode(x)
+        out, _ = self.rnn(feats)
+        out = self.dropout(out)
+        main = nn.functional.log_softmax(self.classifier(out), dim=2)
+        aux = nn.functional.log_softmax(self.aux_classifier(feats), dim=2)
+        return main, aux
 
     def output_length(self, input_width):
         """
@@ -195,8 +215,10 @@ if __name__ == "__main__":
     for width in (256, 512, 1024):
         x = torch.randn(2, 1, 64, width)
         y = model(x)
+        main, aux = model.forward_with_aux(x)
         print(f"input (2, 1, 64, {width:>4})  ->  output {tuple(y.shape)}  "
-              f"predicted length {model.output_length(width)}")
+              f"aux {tuple(aux.shape)}  predicted length {model.output_length(width)}")
         assert y.shape[0] == model.output_length(width), \
             "output_length does not match the real output - CTC would break"
+        assert aux.shape == main.shape, "aux head shape must match main head"
     print("shape checks passed")

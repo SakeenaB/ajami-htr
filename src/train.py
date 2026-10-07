@@ -160,6 +160,9 @@ def main():
                         "Without it a 7M-parameter model memorises 4,344 "
                         "lines: training loss collapses while validation "
                         "error stalls.")
+    p.add_argument("--aux-weight", type=float, default=0.1,
+                   help="weight of the auxiliary CTC loss on the convolutional "
+                        "features (Al-azzawi et al. use 0.1). 0 disables it.")
     p.add_argument("--amp", action="store_true",
                    help="mixed precision - roughly halves epoch time on a "
                         "modern GPU, which is what makes 700+ epochs fit "
@@ -203,7 +206,7 @@ def main():
                                 transform=transform)
     val_ds = AjamiLineDataset(args.csv, args.images, alphabet,
                               split="val", height=args.height)
-    print(f"augmentation: {args.augment}")
+    print(f"augmentation: {args.augment}   aux-CTC weight: {args.aux_weight}")
 
     if args.limit:
         train_ds.df = train_ds.df.head(args.limit).reset_index(drop=True)
@@ -279,7 +282,7 @@ def main():
     # CTC itself is computed in full precision because its log-sum-exp is
     # numerically delicate.
     use_amp = args.amp and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     if use_amp:
         print("mixed precision enabled")
 
@@ -306,8 +309,8 @@ def main():
             labels = batch["labels"].to(device)
             label_lengths = batch["label_lengths"].to(device)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                log_probs = model(images)      # (time, batch, classes)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                log_probs, aux_log_probs = model.forward_with_aux(images)
 
             # True output length per item. Using the padded width here would
             # tell CTC there is more room than the image really occupies.
@@ -320,6 +323,9 @@ def main():
             # half precision and produces silent NaNs.
             loss = criterion(log_probs.float(), labels,
                              input_lengths, label_lengths)
+            if args.aux_weight > 0:
+                loss = loss + args.aux_weight * criterion(
+                    aux_log_probs.float(), labels, input_lengths, label_lengths)
 
             optimiser.zero_grad()
             scaler.scale(loss).backward()
