@@ -160,6 +160,10 @@ def main():
                         "Without it a 7M-parameter model memorises 4,344 "
                         "lines: training loss collapses while validation "
                         "error stalls.")
+    p.add_argument("--no-flip", action="store_true",
+                   help="do NOT mirror line images. Only for the ablation "
+                        "that shows why the flip is needed: Arabic runs right "
+                        "to left while the CRNN scans left to right.")
     p.add_argument("--aux-weight", type=float, default=0.1,
                    help="weight of the auxiliary CTC loss on the convolutional "
                         "features (Al-azzawi et al. use 0.1). 0 disables it.")
@@ -202,11 +206,13 @@ def main():
     # distortion rather than of the model.
     transform = augment.get(args.augment, seed=0)
     train_ds = AjamiLineDataset(args.csv, args.images, alphabet,
-                                split="train", height=args.height,
+                                split="train", height=args.height, flip=not args.no_flip,
                                 transform=transform)
     val_ds = AjamiLineDataset(args.csv, args.images, alphabet,
-                              split="val", height=args.height)
-    print(f"augmentation: {args.augment}   aux-CTC weight: {args.aux_weight}")
+                              split="val", height=args.height, flip=not args.no_flip)
+    print(f"augmentation: {args.augment}   aux-CTC weight: {args.aux_weight}   "
+          f"reading direction: "
+          f"{'NOT flipped (ablation)' if args.no_flip else 'right-to-left (images mirrored)'}")
 
     if args.limit:
         train_ds.df = train_ds.df.head(args.limit).reset_index(drop=True)
@@ -239,7 +245,7 @@ def main():
     # augmentation, too little capacity, or an input too small to show the
     # marks). Without it, a flat validation curve could mean either.
     train_probe_ds = AjamiLineDataset(args.csv, args.images, alphabet,
-                                      split="train", height=args.height)
+                                      split="train", height=args.height, flip=not args.no_flip)
     if args.limit:
         train_probe_ds.df = train_probe_ds.df.head(args.limit)
     train_probe_ds.df = train_probe_ds.df.sample(

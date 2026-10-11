@@ -62,6 +62,7 @@ class AjamiLineDataset(Dataset):
         max_width=MAX_WIDTH,
         transform=None,
         language=None,
+        flip=True,
     ):
         self.images_dir = Path(images_dir)
         self.alphabet = alphabet
@@ -72,6 +73,16 @@ class AjamiLineDataset(Dataset):
         # photometric for TrOCR - which is how error decorrelation is
         # engineered (Section 3.5.4).
         self.transform = transform
+        # Arabic script runs right to left, so the FIRST character of every
+        # transcription sits at the RIGHT edge of the line image. The CRNN
+        # scans columns left to right, and CTC requires the label sequence to
+        # follow the order of the time steps. Without a flip the model is
+        # asked to emit the first character while looking at the end of the
+        # line - something it can memorise for training lines but cannot
+        # learn as a general reading skill. Mirroring the image puts the
+        # first character first in scan order. Labels are left untouched,
+        # in logical (reading) order. Standard practice for Arabic CTC HTR.
+        self.flip = flip
 
         df = pd.read_csv(csv_path)
         df["text"] = df["text"].fillna("").astype(str)
@@ -116,6 +127,9 @@ class AjamiLineDataset(Dataset):
 
         if self.transform is not None:
             array = self.transform(image=array)["image"]
+
+        if self.flip:
+            array = np.ascontiguousarray(array[:, ::-1])
 
         # Scale to [0, 1] and add the channel dimension: (1, H, W).
         tensor = torch.from_numpy(array).float().div(255.0).unsqueeze(0)
