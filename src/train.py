@@ -160,6 +160,10 @@ def main():
                         "Without it a 7M-parameter model memorises 4,344 "
                         "lines: training loss collapses while validation "
                         "error stalls.")
+    p.add_argument("--val-part", default="all", choices=["all", "A", "B"],
+                   help="evaluate and select the best checkpoint on one half "
+                        "of the validation split only. Use A for base models; "
+                        "half B is reserved for the meta-learner (Section 3.6.3).")
     p.add_argument("--no-flip", action="store_true",
                    help="do NOT mirror line images. Only for the ablation "
                         "that shows why the flip is needed: Arabic runs right "
@@ -227,6 +231,13 @@ def main():
         print("OVERFIT DIAGNOSTIC: validating on the training lines. "
               "CER should approach zero. If it plateaus high, the fault is "
               "in the model or the loss, not the data.")
+
+    if args.val_part != "all" and not args.overfit:
+        from dataset import val_half
+        keep = val_ds.df["ImageID"].map(val_half) == args.val_part
+        val_ds.df = val_ds.df[keep].reset_index(drop=True)
+        print(f"validation restricted to half {args.val_part}: {len(val_ds)} "
+              f"lines (the other half is reserved for the meta-learner)")
 
     print("train split:"); print(train_ds.report())
     print("val split:");   print(val_ds.report())

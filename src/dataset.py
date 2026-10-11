@@ -20,6 +20,7 @@ alongside the tensors.
 
 from __future__ import annotations
 
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,23 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from alphabet import Alphabet
+
+
+def val_half(image_id):
+    """
+    Which half of the validation split a line belongs to: "A" or "B".
+
+    Section 3.6.3: the validation partition is divided in two. Half A is used
+    to choose and tune the base models (early stopping, best checkpoint).
+    Half B is never used for that, and is reserved for training the
+    meta-learner, so the meta-learner learns from base-model outputs on lines
+    that did not shape those models.
+
+    The assignment is a fixed hash of the line's ImageID, not a random draw,
+    so every model - CRNN, TrOCR, Kraken - gets exactly the same halves on
+    every run without having to share a file.
+    """
+    return "A" if zlib.crc32(str(image_id).encode("utf-8")) % 2 == 0 else "B"
 
 
 # Fixed input height in pixels. 64 is a common choice for CTC recognisers and
