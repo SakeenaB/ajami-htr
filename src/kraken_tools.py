@@ -138,6 +138,8 @@ def predict(args):
     rows = []
     for part in args.parts:
         sub = df[df.apply(lambda r: in_part(r, part), axis=1)]
+        if args.limit:
+            sub = sub.head(args.limit)
         t0 = time.time()
         for r in sub.itertuples(index=False):
             img = Image.open(Path(args.images) / f"{r.ImageID}.png").convert("L")
@@ -146,6 +148,9 @@ def predict(args):
                          "lang": r.lang, "reference": r.text, "prediction": text,
                          "confidence": json.dumps([round(c, 4) for c in conf])})
         print(f"  {part}: {len(sub)} lines in {time.time()-t0:.0f}s")
+        if rows:
+            print(f"    first ref : {rows[-len(sub)]['reference'][:60]}")
+            print(f"    first pred: {rows[-len(sub)]['prediction'][:60]}")
 
     out = pd.DataFrame(rows)
     out.to_csv(args.out, index=False, encoding="utf-8")
@@ -171,6 +176,8 @@ def main():
     q.add_argument("--parts", nargs="+", default=["valA", "valB", "test"])
     q.add_argument("--out", required=True)
     q.add_argument("--device", default="cpu")
+    q.add_argument("--limit", type=int, default=None,
+                   help="only the first N lines of each part (smoke test)")
     args = ap.parse_args()
     (prep if args.cmd == "prep" else predict)(args)
 
