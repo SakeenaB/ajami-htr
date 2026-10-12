@@ -164,6 +164,10 @@ def main():
                    help="evaluate and select the best checkpoint on one half "
                         "of the validation split only. Use A for base models; "
                         "half B is reserved for the meta-learner (Section 3.6.3).")
+    p.add_argument("--seed", type=int, default=0,
+                   help="random seed for weight initialisation, data order "
+                        "and augmentation. Different seeds give different "
+                        "random starts - one source of ensemble diversity.")
     p.add_argument("--no-flip", action="store_true",
                    help="do NOT mirror line images. Only for the ablation "
                         "that shows why the flip is needed: Arabic runs right "
@@ -190,6 +194,14 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    import random
+    import numpy as np
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    print(f"seed: {args.seed}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
     if device.type == "cpu":
@@ -208,7 +220,7 @@ def main():
     # Augmentation is applied to the training split ONLY. Distorting the
     # validation images would make the reported error a measure of the
     # distortion rather than of the model.
-    transform = augment.get(args.augment, seed=0)
+    transform = augment.get(args.augment, seed=args.seed)
     train_ds = AjamiLineDataset(args.csv, args.images, alphabet,
                                 split="train", height=args.height, flip=not args.no_flip,
                                 transform=transform)

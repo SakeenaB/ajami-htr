@@ -248,7 +248,27 @@ def make_loader(dataset, batch_size=16, shuffle=False, num_workers=2,
         num_workers=num_workers,
         collate_fn=collate,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=_reseed_worker,
     )
+
+
+def _reseed_worker(worker_id):
+    """
+    Give every data-loading worker its own augmentation random stream.
+
+    Each worker receives a COPY of the dataset, including the augmentation
+    pipeline's random generator, and workers are re-created every epoch from
+    the same unused original. Without reseeding, all workers draw identical
+    distortions, and the same sequence repeats every epoch. PyTorch gives
+    each worker a distinct base seed that also changes every epoch
+    (torch.initial_seed()); deriving the generator from it restores real
+    variety while staying reproducible under a fixed --seed.
+    """
+    import numpy as _np
+    info = torch.utils.data.get_worker_info()
+    transform = getattr(info.dataset, "transform", None)
+    if transform is not None and hasattr(transform, "rng"):
+        transform.rng = _np.random.default_rng(torch.initial_seed() % (2 ** 32))
 
 
 if __name__ == "__main__":
