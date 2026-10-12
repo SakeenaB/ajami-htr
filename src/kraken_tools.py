@@ -74,16 +74,26 @@ def prep(args):
         d = out / part
         d.mkdir(parents=True, exist_ok=True)
         rows = df[df.apply(lambda r: in_part(r, part), axis=1)]
+        seen = set()
         for r in rows.itertuples(index=False):
             src = images / f"{r.ImageID}.png"
             if not src.exists():
                 continue
-            dst = d / f"{r.ImageID}.png"
+            # Kraken finds a line's text by cutting the image name at its
+            # FIRST dot and adding ".gt.txt". The corpus IDs contain ".pdf"
+            # (e.g. Infiraji_1.pdf_page_9_line_002), so every line would be
+            # matched to a non-existent file and silently skipped. Kraken's
+            # copies therefore use a dot-free name.
+            safe = r.ImageID.replace(".", "_")
+            if safe in seen:
+                raise SystemExit(f"name collision after removing dots: {safe}")
+            seen.add(safe)
+            dst = d / f"{safe}.png"
             if not dst.exists():
                 os.symlink(src.resolve(), dst)
             # Written exactly as in the corpus: no stripping, no trailing
             # newline, so the multiple spaces between verse halves survive.
-            (d / f"{r.ImageID}.gt.txt").write_text(r.text, encoding="utf-8")
+            (d / f"{safe}.gt.txt").write_text(r.text, encoding="utf-8")
             lists[part].append(str(dst))
         (out / f"{part}.txt").write_text("\n".join(lists[part]) + "\n",
                                          encoding="utf-8")
