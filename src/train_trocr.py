@@ -198,6 +198,9 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--max-len", type=int, default=192)
+    ap.add_argument("--val-part", default="all", choices=["all", "A", "B"],
+                    help="choose the best checkpoint on one validation half "
+                         "only. Use A; half B is reserved for the meta-learner.")
     args = ap.parse_args()
 
     from transformers import (AutoImageProcessor, AutoTokenizer,
@@ -230,6 +233,11 @@ def main():
     val_ds = TrOCRLineDataset(args.csv, args.images, proc, tok, "val",
                               args.max_len, None,
                               max(16, args.limit // 4) if args.limit else None)
+    if args.val_part != "all":
+        from dataset import val_half
+        keep = val_ds.df["ImageID"].map(val_half) == args.val_part
+        val_ds.df = val_ds.df[keep].reset_index(drop=True)
+        print(f"validation restricted to half {args.val_part}: {len(val_ds)} lines")
     print(f"train {len(train_ds)}   val {len(val_ds)}")
     train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,
                               num_workers=args.workers, collate_fn=collate)
