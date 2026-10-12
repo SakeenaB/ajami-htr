@@ -1,0 +1,69 @@
+{
+ "models": [
+  "crnn1",
+  "crnn2",
+  "trocr"
+ ],
+ "single_valB": {
+  "crnn1": 0.10766378244746601,
+  "crnn2": 0.10795220436753193,
+  "trocr": 0.20090646889163577
+ },
+ "overlap_valB": {
+  "crnn1 & crnn2": 0.5479238214174211,
+  "crnn1 & trocr": 0.27626530239356845,
+  "crnn2 & trocr": 0.27380518059102515
+ },
+ "table_valB": [
+  {
+   "members": [
+    "crnn1",
+    "crnn2"
+   ],
+   "majority": 0.10774618871034199,
+   "confidence": 0.103831891223733,
+   "learned": 0.10416151627523691,
+   "oracle": 0.0815409971157808
+  },
+  {
+   "members": [
+    "crnn1",
+    "trocr"
+   ],
+   "majority": 0.10774618871034199,
+   "confidence": 0.1227441285537701,
+   "learned": 0.10774618871034199,
+   "oracle": 0.07993407498969922
+  },
+  {
+   "members": [
+    "crnn2",
+    "trocr"
+   ],
+   "majority": 0.10803461063040791,
+   "confidence": 0.12352698805109188,
+   "learned": 0.10782859497321796,
+   "oracle": 0.07906880922950144
+  },
+  {
+   "members": [
+    "crnn1",
+    "crnn2",
+    "trocr"
+   ],
+   "majority": 0.09859909353110836,
+   "confidence": 0.09802224969097652,
+   "learned": 0.09843428100535641,
+   "oracle": 0.06670786979810465
+  }
+ ],
+ "chosen": {
+  "method": "confidence",
+  "members": [
+   "crnn1",
+   "crnn2",
+   "trocr"
+  ],
+  "valB_cer": 0.09802224969097652
+ }
+}
