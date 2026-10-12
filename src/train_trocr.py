@@ -81,11 +81,17 @@ class TrOCRLineDataset(Dataset):
             img = Image.fromarray(self.transform(image=np.array(img))["image"])
         pixels = self.processor(img.convert("RGB"),
                                 return_tensors="pt").pixel_values[0]
-        ids = codec.encode(self.tok, row.text, max_length=self.max_len,
-                           truncation=True, padding="max_length",
-                           return_tensors="pt")["input_ids"][0]
-        labels = ids.clone()
-        labels[labels == self.tok.pad_token_id] = -100   # ignored by the loss
+        # Target sequence = the text's tokens followed by [SEP] (end of text).
+        # No leading [CLS]: the model is given [CLS] as its START token and
+        # must learn to predict the first real character after it. If the
+        # labels also began with [CLS], the model's first prediction would be
+        # [CLS] - and if that id is the end-of-text id, generation stops at
+        # once and every output is empty.
+        body = codec.encode(self.tok, row.text, add_special_tokens=False)[
+            "input_ids"][: self.max_len - 1]
+        seq = body + [self.tok.sep_token_id]
+        labels = torch.full((self.max_len,), -100, dtype=torch.long)
+        labels[: len(seq)] = torch.tensor(seq, dtype=torch.long)
         return {"pixel_values": pixels, "labels": labels,
                 "text": row.text, "image_id": row.ImageID, "lang": row.lang}
 
@@ -158,6 +164,39 @@ def score(rows):
     return res
 
 
+def configure_special_tokens(model, tok, max_len):
+    """
+    Make start, end and padding ids agree with THIS tokenizer, everywhere.
+
+    The checkpoint descends from an English TrOCR whose RoBERTa tokenizer uses
+    id 2 for end-of-text. In this BERT-style Arabic tokenizer the ids differ,
+    and recent transformers versions generate from model.generation_config,
+    not model.config - so both must be set, or generation can stop on its
+    first step and return empty strings.
+
+    Also removes repetition constraints some TrOCR recipes ship with: here,
+    vowel marks and letters are often single tokens, so the same short token
+    sequence legitimately repeats many times in a line.
+    """
+    start, end, pad = tok.cls_token_id, tok.sep_token_id, tok.pad_token_id
+    for cfg in (model.config, model.generation_config):
+        cfg.decoder_start_token_id = start
+        cfg.eos_token_id = end
+        cfg.pad_token_id = pad
+    gc = model.generation_config
+    gc.bos_token_id = start
+    gc.max_length = max_len
+    for name, neutral in (("no_repeat_ngram_size", 0), ("repetition_penalty", 1.0),
+                          ("length_penalty", 1.0), ("forced_eos_token_id", None),
+                          ("forced_bos_token_id", None), ("min_length", 0)):
+        if hasattr(gc, name):
+            setattr(gc, name, neutral)
+    gc.num_beams = 1
+    gc.early_stopping = False
+    print(f"special ids: start [CLS]={start}  end [SEP]={end}  pad={pad}  "
+          f"unk={tok.unk_token_id}")
+
+
 def set_phase(model, warmup, freeze_encoder):
     """Choose which parameters train in the current phase."""
     for p in model.parameters():
@@ -214,10 +253,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model)
     proc = AutoImageProcessor.from_pretrained(args.model)
     model = VisionEncoderDecoderModel.from_pretrained(args.model).to(device)
-    model.config.decoder_start_token_id = (
-        model.config.decoder_start_token_id or tok.cls_token_id)
-    model.config.pad_token_id = tok.pad_token_id
-    model.config.eos_token_id = model.config.eos_token_id or tok.sep_token_id
+    configure_special_tokens(model, tok, args.max_len)
     print(f"vocab {len(tok)}   params "
           f"{sum(p.numel() for p in model.parameters())/1e6:.0f}M")
 
@@ -226,6 +262,10 @@ def main():
     back = codec.round_trip(tok, sample)
     print("codec check:", "exact" if back == sample
           else f"MISMATCH - {codec.first_difference(sample, back)}")
+    first = codec.encode(tok, sample, add_special_tokens=False)["input_ids"][:5]
+    print(f"label check: target starts {tok.convert_ids_to_tokens(first)} "
+          f"and ends with [SEP]={tok.sep_token_id}; decoder starts from "
+          f"{model.generation_config.decoder_start_token_id}")
 
     train_ds = TrOCRLineDataset(args.csv, args.images, proc, tok, "train",
                                 args.max_len, augment.get("photometric", 0),
@@ -294,6 +334,9 @@ def main():
         elif not warm:
             bad += 1
         print(line, flush=True)
+        if rows:
+            print(f"    sample  ref : {rows[0]['reference'][:60]}")
+            print(f"    sample  pred: {rows[0]['prediction'][:60]}", flush=True)
         (out_dir / "history.json").write_text(json.dumps(history, indent=1))
         if bad >= args.patience:
             print(f"no improvement for {args.patience} epochs - stopping")
