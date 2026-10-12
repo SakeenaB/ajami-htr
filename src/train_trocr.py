@@ -236,7 +236,19 @@ def main():
     ap.add_argument("--patience", type=int, default=4)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--workers", type=int, default=2)
-    ap.add_argument("--max-len", type=int, default=192)
+    ap.add_argument("--max-len", type=int, default=128,
+                    help="longest token sequence for labels and generation. "
+                         "The longest line is 106 characters; WordPiece never "
+                         "produces more tokens than characters, so 128 covers "
+                         "every line plus the end token.")
+    ap.add_argument("--eval-every", type=int, default=1,
+                    help="validate every N epochs. Generation is the slow "
+                         "part of an epoch, especially early on when the "
+                         "model has not yet learned to stop.")
+    ap.add_argument("--eval-batch-size", type=int, default=16,
+                    help="batch size for generation during validation; no "
+                         "gradients are kept, so it can be larger than the "
+                         "training batch")
     ap.add_argument("--val-part", default="all", choices=["all", "A", "B"],
                     help="choose the best checkpoint on one validation half "
                          "only. Use A; half B is reserved for the meta-learner.")
@@ -281,7 +293,7 @@ def main():
     print(f"train {len(train_ds)}   val {len(val_ds)}")
     train_loader = DataLoader(train_ds, args.batch_size, shuffle=True,
                               num_workers=args.workers, collate_fn=collate)
-    val_loader = DataLoader(val_ds, args.batch_size, shuffle=False,
+    val_loader = DataLoader(val_ds, args.eval_batch_size, shuffle=False,
                             num_workers=args.workers, collate_fn=collate)
 
     use_amp = device.type == "cuda"
@@ -314,10 +326,17 @@ def main():
             total += loss.item()
             n += 1
 
+        train_time = time.time() - t0
+        if not (epoch % args.eval_every == 0 or epoch == args.epochs):
+            print(f"epoch {epoch:>3}{' (warm-up)' if warm else ''}  "
+                  f"loss {total/max(1, n):.4f}  {train_time:6.0f}s", flush=True)
+            continue
+
         rows = predict(model, tok, val_loader, device, args.max_len)
         res = score(rows)
         line = (f"epoch {epoch:>3}{' (warm-up)' if warm else ''}  "
-                f"loss {total/max(1, n):.4f}  {time.time()-t0:6.0f}s  |  "
+                f"loss {total/max(1, n):.4f}  {train_time:5.0f}s train "
+                f"+{time.time()-t0-train_time:5.0f}s val  |  "
                 f"val CER {res['cer']*100:6.2f}%  WER {res['wer']*100:6.2f}%  "
                 f"diacritic {res['diacritic_cer']*100:6.2f}%")
         history.append({"epoch": epoch, "warmup": warm,
@@ -339,11 +358,11 @@ def main():
             print(f"    sample  pred: {rows[0]['prediction'][:60]}", flush=True)
         (out_dir / "history.json").write_text(json.dumps(history, indent=1))
         if bad >= args.patience:
-            print(f"no improvement for {args.patience} epochs - stopping")
+            print(f"no improvement for {args.patience} evaluations - stopping")
             break
 
     print(f"\nbest val CER {best*100:.2f}%")
-    for r in rows[:3]:
+    for r in (rows if "rows" in locals() else [])[:3]:
         print(f"  ref : {r['reference']}\n  pred: {r['prediction']}\n")
 
 
