@@ -105,24 +105,37 @@ def prep(args):
 # predict
 # ---------------------------------------------------------------------------
 
-def recognise(net, image):
+def _rpred(net, image, bounds, bidi):
+    from kraken import rpred
+    try:
+        return list(rpred.rpred(net, image, bounds, bidi_reordering=bidi))
+    except TypeError:                     # older signature without the option
+        if not bidi:
+            print("WARNING: this Kraken cannot switch bidi reordering off")
+        return list(rpred.rpred(net, image, bounds))
+
+
+def recognise(net, image, bidi=True):
     """
     Recognise one pre-cut line image with Kraken and return (text, conf).
 
     Kraken's recognition API changed between versions: 5.x takes a
     Segmentation object, 4.x a plain dictionary. Both are tried.
+
+    bidi=False is for a model trained on MIRRORED images with text in
+    reading order (ketos --no-reorder): its output is already in reading
+    order, and Kraken's own reordering would scramble it.
     """
-    from kraken import rpred
     w, h = image.size
     try:
         from kraken.containers import BBoxLine, Segmentation
         seg = Segmentation(type="bbox", imagename="line", text_direction="horizontal-lr",
                            script_detection=False,
                            lines=[BBoxLine(id="l0", bbox=(0, 0, w, h))])
-        records = list(rpred.rpred(net, image, seg))
+        records = _rpred(net, image, seg, bidi)
     except ImportError:
-        records = list(rpred.rpred(net, image, {"boxes": [(0, 0, w, h)],
-                                                "text_direction": "horizontal-lr"}))
+        records = _rpred(net, image, {"boxes": [(0, 0, w, h)],
+                                      "text_direction": "horizontal-lr"}, bidi)
     if not records:
         return "", []
     rec = records[0]
@@ -133,7 +146,7 @@ def recognise(net, image):
 
 
 def predict(args):
-    from PIL import Image
+    from PIL import Image, ImageOps
     from kraken.lib import models
 
     device = args.device
@@ -153,7 +166,9 @@ def predict(args):
         t0 = time.time()
         for r in sub.itertuples(index=False):
             img = Image.open(Path(args.images) / f"{r.ImageID}.png").convert("L")
-            text, conf = recognise(net, img)
+            if args.mirror:
+                img = ImageOps.mirror(img)
+            text, conf = recognise(net, img, bidi=not args.no_bidi)
             rows.append({"model": args.name, "part": part, "ImageID": r.ImageID,
                          "lang": r.lang, "reference": r.text, "prediction": text,
                          "confidence": json.dumps([round(c, 4) for c in conf])})
@@ -186,6 +201,11 @@ def main():
     q.add_argument("--parts", nargs="+", default=["valA", "valB", "test"])
     q.add_argument("--out", required=True)
     q.add_argument("--device", default="cpu")
+    q.add_argument("--mirror", action="store_true",
+                   help="mirror each line image first (model trained on mirrored lines)")
+    q.add_argument("--no-bidi", action="store_true",
+                   help="do not apply Kraken's bidi reordering to the output "
+                        "(model trained with ketos --no-reorder)")
     q.add_argument("--limit", type=int, default=None,
                    help="only the first N lines of each part (smoke test)")
     args = ap.parse_args()
