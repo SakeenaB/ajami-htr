@@ -539,8 +539,20 @@ def _make(cls, *args, **kwargs):
             kwargs.pop(bad)
 
 
+def launch(demo, **kwargs):
+    """
+    Start the app. Gradio 6 takes the page styling in launch(); older
+    versions took it in Blocks(), where build_app already passed it.
+    """
+    try:
+        demo.launch(css=CSS, **kwargs)
+    except TypeError:
+        demo.launch(**kwargs)
+
+
 def build_app(reader, kraken_bin):
     import gradio as gr
+    import warnings
 
     # Offer only what this server can actually do.
     have_kraken = bool(kraken_bin) and Path(kraken_bin).exists()
@@ -564,7 +576,10 @@ def build_app(reader, kraken_bin):
         body = render_html(crops, results, secs, method, show_models)
         return draw_boxes(image, boxes), body, text
 
-    with _make(gr.Blocks, title="Ajami Lens", css=CSS) as demo:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")          # Gradio 6: css belongs to launch()
+        blocks = _make(gr.Blocks, title="Ajami Lens", css=CSS)
+    with blocks as demo:
         gr.Markdown(
             "# Ajami Lens\n"
             "Read a handwritten **Hausa or Fulfulde Ajami** manuscript. Upload a page (or one "
@@ -699,7 +714,7 @@ def main():
         print(f"{len(results)} lines via {method} in {secs:.1f}s -> {args.out}")
         print(text)
         return
-    build_app(reader, args.kraken_bin).launch(share=args.share)
+    launch(build_app(reader, args.kraken_bin), share=args.share)
 
 
 if __name__ == "__main__":

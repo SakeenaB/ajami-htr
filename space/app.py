@@ -17,7 +17,7 @@ from huggingface_hub import snapshot_download          # noqa: E402
 
 torch.set_num_threads(max(1, os.cpu_count() or 1))
 
-from lens import Reader, build_app                     # noqa: E402
+from lens import Reader, build_app, launch             # noqa: E402
 
 models = snapshot_download(os.environ["MODEL_REPO"], token=os.environ.get("HF_TOKEN"))
 reader = Reader(models)
@@ -26,4 +26,4 @@ try:
     demo.queue(default_concurrency_limit=1, max_size=20)
 except TypeError:                                      # older Gradio
     demo.queue()
-demo.launch()
+launch(demo)
