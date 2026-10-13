@@ -50,6 +50,7 @@ HEIGHT = 64            # CRNN input height, as trained
 MAX_WIDTH = 1600       # CRNN width cap, as trained (dataset.MAX_WIDTH)
 MAX_LEN = 128          # TrOCR generation limit, as trained
 MODEL_ORDER = ["crnn1", "crnn2", "trocr"]   # order used by ensemble.py (vote ties)
+MAX_LINES = 60         # a public server must not be tied up by one huge image
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +490,7 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print):
             boxes, method = segment_projection(img), "the projection segmenter"
         boxes = group_rows(boxes)
     boxes = [(max(0, x0), max(0, y0), min(W, x1), min(H, y1)) for x0, y0, x1, y1 in boxes
-             if x1 - x0 > 10 and y1 - y0 > 8]
+             if x1 - x0 > 10 and y1 - y0 > 8][:MAX_LINES]
     crops = [img.crop(b) for b in boxes]
     t0 = time.time()
     results = reader.read(crops)
@@ -517,8 +518,13 @@ def _make(cls, *args, **kwargs):
 def build_app(reader, kraken_bin):
     import gradio as gr
 
-    modes = {"Automatic": "auto", "Kraken segmenter": "kraken",
-             "Simple segmenter": "projection", "The image is one line": "single"}
+    # Offer only what this server can actually do.
+    have_kraken = bool(kraken_bin) and Path(kraken_bin).exists()
+    modes = {"Automatic": "auto"}
+    if have_kraken:
+        modes["Kraken segmenter"] = "kraken"
+    modes["Simple segmenter"] = "projection"
+    modes["The image is one line"] = "single"
 
     def run(image, mode_label, show_models):
         if image is None:
@@ -535,11 +541,17 @@ def build_app(reader, kraken_bin):
         return draw_boxes(image, boxes), body, text
 
     with _make(gr.Blocks, title="Ajami Lens", css=CSS) as demo:
-        gr.Markdown("# Ajami Lens\nRead a handwritten Hausa or Fulfulde Ajami page. "
-                    "Lines are found automatically, read by three models (two CRNNs and an "
-                    "adapted TrOCR), and combined by the confidence vote that reached "
-                    "**10.42% character error rate** on the held-out test set, below the "
-                    "published benchmark of 10.66%.")
+        gr.Markdown(
+            "# Ajami Lens\n"
+            "Read a handwritten **Hausa or Fulfulde Ajami** manuscript. Upload a page (or one "
+            "line), press **Read**, and get the text.\n\n"
+            "Each line is read by three models (two CRNNs and an adapted TrOCR) and combined by "
+            "a confidence vote, the system that reached **10.42% character error rate** on a "
+            "held-out test set, below the published benchmark of 10.66%. Characters the models "
+            "disagreed on are highlighted: check those first.\n\n"
+            "*Research prototype from a University of Ibadan final-year project. It reads clean "
+            "scans of manuscripts similar to its training material best. On the free server a "
+            "full page can take a few minutes.*")
         with gr.Row():
             inp = _make(gr.Image, type="pil", label="Manuscript page or line",
                         sources=["upload", "webcam", "clipboard"])
