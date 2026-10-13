@@ -160,20 +160,32 @@ def _parse_segmentation(path):
     try:
         data = json.loads(raw)
 
-        def walk(o):
+        # Kraken's JSON describes text REGIONS (whole blocks) as well as
+        # lines, and both carry a "boundary". Only the lines are wanted:
+        # a region box would swallow every line inside it.
+        def find_lines(o):
             if isinstance(o, dict):
-                if isinstance(o.get("boundary"), list) and o["boundary"]:
-                    boxes.append(_bbox(o["boundary"]))
-                    return
-                if isinstance(o.get("bbox"), (list, tuple)) and len(o["bbox"]) == 4:
-                    boxes.append(tuple(float(v) for v in o["bbox"]))
-                    return
-                for v in o.values():
-                    walk(v)
+                if isinstance(o.get("lines"), list):
+                    return o["lines"]
+                for k, v in o.items():
+                    if k != "regions":
+                        found = find_lines(v)
+                        if found is not None:
+                            return found
             elif isinstance(o, list):
                 for v in o:
-                    walk(v)
-        walk(data)
+                    found = find_lines(v)
+                    if found is not None:
+                        return found
+            return None
+
+        for ln in find_lines(data) or []:
+            if not isinstance(ln, dict):
+                continue
+            if isinstance(ln.get("boundary"), list) and ln["boundary"]:
+                boxes.append(_bbox(ln["boundary"]))
+            elif isinstance(ln.get("bbox"), (list, tuple)) and len(ln["bbox"]) == 4:
+                boxes.append(tuple(float(v) for v in ln["bbox"]))
         return boxes
     except json.JSONDecodeError:
         pass
@@ -231,12 +243,24 @@ def group_rows(boxes, overlap=0.5):
     Merge boxes that share a row (e.g. the two halves of a verse found as
     separate lines) into one box per row, as in the corpus, and sort rows
     top to bottom.
+
+    Safeguards: a box far taller than a typical line is a block, not a line,
+    and is dropped; a box narrower than a line is tall is a speck of dirt or
+    a stray mark, and is dropped; and only boxes of similar height are ever
+    merged, so no line can be swallowed by a larger box.
     """
+    if not boxes:
+        return []
+    heights = sorted(b[3] - b[1] for b in boxes)
+    med = heights[len(heights) // 2]
+    boxes = [b for b in boxes
+             if (b[3] - b[1]) <= 2.5 * med and (b[2] - b[0]) >= 0.8 * med]
     rows = []
     for b in sorted(boxes, key=lambda b: (b[1] + b[3]) / 2):
         for r in rows:
             inter = min(r[3], b[3]) - max(r[1], b[1])
-            if inter > overlap * min(r[3] - r[1], b[3] - b[1]):
+            hr, hb = r[3] - r[1], b[3] - b[1]
+            if inter > overlap * min(hr, hb) and max(hr, hb) <= 2 * min(hr, hb):
                 r[0], r[1] = min(r[0], b[0]), min(r[1], b[1])
                 r[2], r[3] = max(r[2], b[2]), max(r[3], b[3])
                 break
@@ -610,12 +634,21 @@ def _self_test():
     assert group_rows(halves) == [(100, 100, 1000, 150), (100, 300, 1000, 350)]
     print("two halves of a verse are merged into one line")
 
+    lines = [(100, 100 + 60 * i, 1000, 150 + 60 * i) for i in range(8)]
+    region = (90, 90, 1010, 640)                 # a whole text block
+    speck = (500, 700, 530, 740)                 # a smudge
+    got = group_rows(lines + [region, speck])
+    assert got == [tuple(b) for b in lines], got
+    print("a text-block box and a speck are ignored; all 8 lines kept separate")
+
     alto = ('<alto xmlns="http://www.loc.gov/standards/alto/ns-v4#"><Layout><Page><PrintSpace>'
             '<TextBlock><TextLine HPOS="10" VPOS="20" WIDTH="300" HEIGHT="40"><Shape>'
             '<Polygon POINTS="10,20 310,20 310,60 10,60"/></Shape></TextLine></TextBlock>'
             '</PrintSpace></Page></Layout></alto>')
-    native = json.dumps({"type": "baselines", "lines": [
-        {"baseline": [[5, 50], [200, 52]], "boundary": [[5, 30], [200, 30], [200, 70], [5, 70]]}]})
+    native = json.dumps({"type": "baselines",
+        "regions": {"text": [{"boundary": [[0, 0], [500, 0], [500, 900], [0, 900]]}]},
+        "lines": [{"baseline": [[5, 50], [200, 52]],
+                   "boundary": [[5, 30], [200, 30], [200, 70], [5, 70]]}]})
     with tempfile.TemporaryDirectory() as dd:
         (Path(dd) / "a.xml").write_text(alto)
         (Path(dd) / "n.json").write_text(native)
