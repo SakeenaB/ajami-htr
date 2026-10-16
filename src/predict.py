@@ -99,6 +99,7 @@ def predict_crnn(args, parts):
     from alphabet import Alphabet
     from crnn import CRNN
     from dataset import AjamiLineDataset, make_loader
+    from bidi_order import mirror_order_with_confidence
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
@@ -122,7 +123,8 @@ def predict_crnn(args, parts):
         # Mirroring must match training: the model reads right-to-left text
         # from mirrored images.
         ds = AjamiLineDataset(args.csv, args.images, alphabet, split=split,
-                              height=args.height, flip=not args.no_flip)
+                              height=args.height, flip=not args.no_flip,
+                              bidi_runs=args.bidi_runs)
         ds.df = ds.df[part_mask(ds.df, part)].reset_index(drop=True)
         loader = make_loader(ds, batch_size=32, shuffle=False,
                              num_workers=args.workers)
@@ -135,6 +137,8 @@ def predict_crnn(args, parts):
                     T = model.output_length(int(batch["image_widths"][b]))
                     text, conf = ctc_decode_with_confidence(
                         probs[:T, b, :], alphabet.index_to_char)
+                    if args.bidi_runs and not args.no_flip:
+                        text, conf = mirror_order_with_confidence(text, conf)
                     rows.append({"part": part,
                                  "ImageID": batch["image_ids"][b],
                                  "lang": batch["langs"][b],
@@ -223,6 +227,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--height", type=int, default=64)
     ap.add_argument("--no-flip", action="store_true")
+    ap.add_argument("--bidi-runs", action="store_true",
+                    help="CRNN trained with --bidi-runs: put each prediction "
+                         "back into logical order")
     ap.add_argument("--max-len", type=int, default=128)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--show-test", action="store_true",

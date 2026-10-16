@@ -30,6 +30,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from alphabet import Alphabet
+from bidi_order import mirror_order
 
 
 def val_half(image_id):
@@ -81,6 +82,7 @@ class AjamiLineDataset(Dataset):
         transform=None,
         language=None,
         flip=True,
+        bidi_runs=False,
     ):
         self.images_dir = Path(images_dir)
         self.alphabet = alphabet
@@ -101,8 +103,15 @@ class AjamiLineDataset(Dataset):
         # first character first in scan order. Labels are left untouched,
         # in logical (reading) order. Standard practice for Arabic CTC HTR.
         self.flip = flip
+        # Digits and Latin words inside a right-to-left line are written
+        # left to right. With bidi_runs, the label of a mirrored line is put
+        # in the order the characters are actually met (bidi_order.py).
+        # Off for Ajami, on for the Arabic corpus.
+        self.bidi_runs = bidi_runs
 
-        df = pd.read_csv(csv_path)
+        # Read every column as text: a line whose transcription is only
+        # digits ("007", "1.50") must not be turned into a number.
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
         df["text"] = df["text"].fillna("").astype(str)
 
         if split is not None:
@@ -152,7 +161,8 @@ class AjamiLineDataset(Dataset):
         # Scale to [0, 1] and add the channel dimension: (1, H, W).
         tensor = torch.from_numpy(array).float().div(255.0).unsqueeze(0)
 
-        label = torch.tensor(self.alphabet.encode(row.text), dtype=torch.long)
+        label_text = mirror_order(row.text) if (self.flip and self.bidi_runs) else row.text
+        label = torch.tensor(self.alphabet.encode(label_text), dtype=torch.long)
 
         return {
             "image": tensor,

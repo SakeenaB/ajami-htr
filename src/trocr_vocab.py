@@ -85,7 +85,7 @@ def main():
     from transformers import AutoTokenizer
     from tokenizers import AddedToken
 
-    df = pd.read_csv(args.csv).fillna({"text": ""})
+    df = pd.read_csv(args.csv, dtype=str, keep_default_na=False)
     texts = df["text"].astype(str).tolist()
     corpus_chars = sorted(set("".join(texts)) - {" "})
 

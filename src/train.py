@@ -39,6 +39,7 @@ import augment
 from alphabet import Alphabet, check_round_trip
 from crnn import CRNN, greedy_decode
 from dataset import AjamiLineDataset, make_loader
+from bidi_order import mirror_order, involution_failures
 from metrics import cer, wer, diacritic_cer
 
 
@@ -116,7 +117,11 @@ def evaluate(model, loader, alphabet, device, max_batches=None):
             images = batch["images"].to(device)
             log_probs = model(images)
             lengths = [model.output_length(int(w)) for w in batch["image_widths"]]
-            hyps.extend(greedy_decode(log_probs, alphabet, lengths))
+            decoded = greedy_decode(log_probs, alphabet, lengths)
+            ds = loader.dataset
+            if getattr(ds, "flip", False) and getattr(ds, "bidi_runs", False):
+                decoded = [mirror_order(h) for h in decoded]
+            hyps.extend(decoded)
             refs.extend(batch["texts"])
             langs.extend(batch["langs"])
 
@@ -189,6 +194,15 @@ def main():
     p.add_argument("--no-schedule", action="store_true",
                    help="hold the learning rate constant (use for short runs, "
                         "where the milestones would otherwise fire immediately)")
+    p.add_argument("--bidi-runs", action="store_true",
+                   help="order the labels of mirrored lines so that digits and "
+                        "Latin words read the way they are written "
+                        "(bidi_order.py). Used for the Arabic corpus.")
+    p.add_argument("--init-from", default=None,
+                   help="start from the weights of another checkpoint (e.g. the "
+                        "Ajami CRNN). Layers whose shape differs - the output "
+                        "layers, when the alphabet differs - start fresh. "
+                        "Unlike --resume, the optimiser and epoch restart.")
     args = p.parse_args()
 
     out_dir = Path(args.out)
@@ -223,9 +237,10 @@ def main():
     transform = augment.get(args.augment, seed=args.seed)
     train_ds = AjamiLineDataset(args.csv, args.images, alphabet,
                                 split="train", height=args.height, flip=not args.no_flip,
-                                transform=transform)
+                                transform=transform, bidi_runs=args.bidi_runs)
     val_ds = AjamiLineDataset(args.csv, args.images, alphabet,
-                              split="val", height=args.height, flip=not args.no_flip)
+                              split="val", height=args.height, flip=not args.no_flip,
+                              bidi_runs=args.bidi_runs)
     print(f"augmentation: {args.augment}   aux-CTC weight: {args.aux_weight}   "
           f"reading direction: "
           f"{'NOT flipped (ablation)' if args.no_flip else 'right-to-left (images mirrored)'}")
@@ -251,6 +266,12 @@ def main():
         print(f"validation restricted to half {args.val_part}: {len(val_ds)} "
               f"lines (the other half is reserved for the meta-learner)")
 
+    if args.bidi_runs and not args.no_flip:
+        texts = train_ds.df["text"].tolist()
+        changed = sum(mirror_order(t) != t for t in texts)
+        fails = involution_failures(texts)
+        print(f"reading order: {changed} training lines contain left-to-right "
+              f"runs; {len(fails)} not exactly restored by the inverse")
     print("train split:"); print(train_ds.report())
     print("val split:");   print(val_ds.report())
     print()
@@ -268,7 +289,8 @@ def main():
     # augmentation, too little capacity, or an input too small to show the
     # marks). Without it, a flat validation curve could mean either.
     train_probe_ds = AjamiLineDataset(args.csv, args.images, alphabet,
-                                      split="train", height=args.height, flip=not args.no_flip)
+                                      split="train", height=args.height, flip=not args.no_flip,
+                                      bidi_runs=args.bidi_runs)
     if args.limit:
         train_probe_ds.df = train_probe_ds.df.head(args.limit)
     train_probe_ds.df = train_probe_ds.df.sample(
@@ -281,6 +303,17 @@ def main():
     model = CRNN(n_classes=alphabet.size_with_blank,
                  input_height=args.height).to(device)
     print(f"parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    if args.init_from:
+        source = torch.load(args.init_from, map_location=device)
+        source = source.get("model", source)
+        own = model.state_dict()
+        kept = {k: v for k, v in source.items()
+                if k in own and own[k].shape == v.shape}
+        fresh = [k for k in own if k not in kept]
+        own.update(kept)
+        model.load_state_dict(own)
+        print(f"initialised {len(kept)} of {len(own)} tensors from {args.init_from}; "
+              f"fresh: {', '.join(fresh) or 'none'}")
 
     check_ctc_feasible(train_ds, model, sample=500)
     print()

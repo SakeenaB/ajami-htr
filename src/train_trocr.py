@@ -60,7 +60,7 @@ class TrOCRLineDataset(Dataset):
 
     def __init__(self, csv, images_dir, processor, tokenizer, split,
                  max_len=192, transform=None, limit=None):
-        df = pd.read_csv(csv).fillna({"text": ""})
+        df = pd.read_csv(csv, dtype=str, keep_default_na=False)
         df = df[(df["split"] == split) & (df["text"].str.len() > 0)]
         if limit:
             df = df.head(limit)
@@ -270,7 +270,7 @@ def main():
           f"{sum(p.numel() for p in model.parameters())/1e6:.0f}M")
 
     # Sanity: the codec must reproduce a real line exactly before training.
-    sample = pd.read_csv(args.csv).fillna({"text": ""}).text.iloc[0]
+    sample = pd.read_csv(args.csv, dtype=str, keep_default_na=False).text.iloc[0]
     back = codec.round_trip(tok, sample)
     print("codec check:", "exact" if back == sample
           else f"MISMATCH - {codec.first_difference(sample, back)}")

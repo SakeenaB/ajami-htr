@@ -554,6 +554,7 @@ def main():
     final_name = method
 
     bench = None
+    bench_subset = None
     if args.benchmark:
         b = pd.read_csv(args.benchmark, keep_default_na=False, dtype=str)
         bmap = dict(zip(b["ImageID"], b["Prediction"]))
@@ -561,9 +562,13 @@ def main():
             bench = [bmap[l["id"]] for l in test]
             systems["benchmark"] = bench
         else:
-            missing = sum(l["id"] not in bmap for l in test)
-            print(f"WARNING: {missing} test lines missing from the benchmark "
-                  "file; benchmark comparison skipped")
+            # The published system did not output every test line (Muharaf:
+            # 1,303 of 1,334). Every system is still scored on ALL test lines
+            # above; the head-to-head comparison uses the lines both have.
+            idx = [i for i, l in enumerate(test) if l["id"] in bmap]
+            bench_subset = (idx, [bmap[test[i]["id"]] for i in idx])
+            print(f"NOTE: the benchmark covers {len(idx)} of {len(test)} test "
+                  "lines; it is compared with our systems on those lines only")
 
     print(f"\nTEST SET ({len(test)} lines) - scored once")
     print(f"  {'system':<12} {'CER':>8} {'WER':>8} {'diacritic':>10} "
@@ -586,6 +591,23 @@ def main():
     if bench is not None:
         comparisons["vs_benchmark"] = paired_bootstrap(
             trefs, systems[final_name], bench)
+    if bench_subset is not None:
+        idx, bhyps = bench_subset
+        srefs = [trefs[i] for i in idx]
+        slangs = [tlangs[i] for i in idx]
+        sub = {name: [systems[name][i] for i in idx]
+               for name in dict.fromkeys([final_name, best_test_single, *models])}
+        sub["benchmark"] = bhyps
+        print(f"\nON THE {len(idx)} TEST LINES THE BENCHMARK COVERS")
+        results["on_benchmark_lines"] = {}
+        for name, hyps in sub.items():
+            r = report(srefs, hyps, slangs)
+            results["on_benchmark_lines"][name] = r
+            print(f"  {name:<12} {pct(r['cer']):>8} {pct(r['wer']):>8} "
+                  f"{pct(r['diacritic_cer']):>10} {pct(r['cer_spaces_collapsed']):>9}")
+        comparisons["vs_benchmark_on_covered_lines"] = paired_bootstrap(
+            srefs, sub[final_name], bhyps)
+
     print("\npaired bootstrap (2,000 resamples of test lines)")
     for k, v in comparisons.items():
         print(f"  {final_name} {k}: CER difference {v['diff_mean']*100:+.2f} "
