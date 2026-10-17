@@ -117,11 +117,20 @@ def predict(model, tok, loader, device, max_len=192, beams=1):
     meta-learner needs (Section 3.6.3).
     """
     model.eval()
+    # Release memory cached by the training step before generating; on a
+    # 15 GB T4 the leftover cache can leave too little room for generation.
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     special = set(tok.all_special_ids)
     rows = []
     for batch in loader:
+        # use_cache=True: each step feeds only the newest token and reuses the
+        # earlier keys and values. Without it, every step recomputes the whole
+        # sequence, so time and memory grow with the square of the length -
+        # harmless at 128 tokens (Ajami), out of memory at 256 (Muharaf).
         out = model.generate(batch["pixel_values"].to(device),
                              max_length=max_len, num_beams=beams,
+                             use_cache=True,
                              output_scores=True, return_dict_in_generate=True)
         seqs = out.sequences
         step_probs = None
