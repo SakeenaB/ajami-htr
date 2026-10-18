@@ -64,11 +64,16 @@ MAX_WIDTH = 1600       # CRNN width cap, as trained (dataset.MAX_WIDTH)
 PROFILES = {
     "ajami": {"label": "Ajami (Hausa, Fulfulde)", "dir": "", "crnns": ["crnn1", "crnn2"],
               "order": ["crnn1", "crnn2", "trocr"], "max_len": 128, "bidi": False,
-              "lang": "ha-Arab"},
+              "lang": "ha-Arab", "lm": {"order": 8, "lam": 0.15, "gap_bias": 0.0}},
     "arabic": {"label": "Arabic", "dir": "arabic", "crnns": ["crnn1", "crnn2", "crnn3"],
                "order": ["crnn1", "crnn3", "crnn2", "trocr"], "max_len": 256, "bidi": True,
-               "lang": "ar"},
+               "lang": "ar", "lm": {"order": 8, "lam": 0.25, "gap_bias": -0.8}},
 }
+# "lm": the character language model in the vote (lm_vote.py), built at start-up
+# from <models>/lm_ajami.txt or <models>/lm_arabic.txt: the training
+# transcriptions, one line each. Settings were tuned on validation
+# half A (Arabic) or by cross-validation on half B (Ajami); the vote without
+# it is the evaluated system, and the switch in the app restores it.
 MAX_LINES = 60         # a public server must not be tied up by one huge image
 
 
@@ -342,7 +347,7 @@ def _find(root, name):
 class _Script:
     """One script's members: its CRNNs and its TrOCR, loaded once."""
 
-    def __init__(self, key, root, device, torch):
+    def __init__(self, key, root, device, torch, models_root=None):
         from alphabet import Alphabet
         from crnn import CRNN
         from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel
@@ -365,6 +370,19 @@ class _Script:
         configure_special_tokens(self.trocr, self.tok, self.profile["max_len"])
         self.trocr.eval()
         print(f"{key}: loaded trocr from {best} on {device}")
+        self.lm = None
+        # lm_<script>.txt at the top of the models folder (lm_ajami.txt, lm_arabic.txt);
+        # lm_text.txt inside the script's own folder also works
+        lm_text = Path(models_root or root) / f"lm_{key}.txt"
+        if not lm_text.exists():
+            lm_text = root / "lm_text.txt"
+        if lm_text.exists():
+            from lm_vote import KNLM
+            texts = [t for t in lm_text.read_text(encoding="utf-8").splitlines() if t.strip()]
+            self.lm = KNLM.from_texts(texts, order=self.profile["lm"]["order"])
+            print(f"{key}: language model built from {len(texts)} training lines")
+        else:
+            print(f"{key}: no lm_{key}.txt, the language model option is off")
 
     def _read_crnn(self, model, alphabet, images):
         from predict import ctc_decode_with_confidence
@@ -403,15 +421,20 @@ class _Script:
                 out.append((r["prediction"], json.loads(r["confidence"])))
         return out
 
-    def read(self, images):
+    def read(self, images, use_lm=True):
         per_model = {name: self._read_crnn(model, alphabet, images)
                      for name, model, alphabet in self.crnns}
         per_model["trocr"] = self._read_trocr(images)
-        return combine(per_model, self.profile["order"], len(images))
+        lm = self.lm if use_lm else None
+        return combine(per_model, self.profile["order"], len(images), lm, self.profile["lm"])
 
 
-def combine(per_model, order, n):
-    """The evaluated vote over each line's readings, members in evaluation order."""
+def combine(per_model, order, n, lm=None, lm_settings=None):
+    """
+    The vote over each line's readings, members in evaluation order. With a
+    language model, the vote is searched with it (lm_vote.lm_decode);
+    without one, it is exactly the evaluated confidence vote.
+    """
     results = []
     for i in range(n):
         hyps = []
@@ -419,7 +442,11 @@ def combine(per_model, order, n):
             text, conf = per_model[name][i]
             conf = (list(conf) + [0.5] * len(text))[: len(text)]
             hyps.append(Hypothesis(name, text, conf))
-        text, flags = ensemble_line(hyps)
+        if lm is not None:
+            from lm_vote import lm_decode
+            text, flags = lm_decode(hyps, lm, lam=lm_settings["lam"], gap_bias=lm_settings["gap_bias"])
+        else:
+            text, flags = ensemble_line(hyps)
         results.append({"text": text, "unsure": flags,
                         "models": {h.model: h.text for h in hyps}})
     return results
@@ -436,14 +463,14 @@ class Reader:
         for key, profile in PROFILES.items():
             sub = root / profile["dir"] if profile["dir"] else root
             if all((sub / name).exists() for name in profile["crnns"] + ["trocr"]):
-                self.scripts[key] = _Script(key, sub, self.device, torch)
+                self.scripts[key] = _Script(key, sub, self.device, torch, models_root=root)
         if not self.scripts:
             raise SystemExit(f"no complete set of models under {root}")
 
-    def read(self, images, script="ajami"):
+    def read(self, images, script="ajami", use_lm=True):
         if not images:
             return []
-        return self.scripts[script].read(images)
+        return self.scripts[script].read(images, use_lm)
 
 
 # ---------------------------------------------------------------------------
@@ -537,12 +564,12 @@ CSS = """
 .nq-line img { max-width: 100%; height: auto; display: block; border-radius: 2px;
   box-shadow: 0 0 0 1px var(--nq-rule); background: #fff; }
 .nq-text { font-family: 'Scheherazade New', 'Amiri', 'Noto Naskh Arabic', serif; font-size: 1.95rem; line-height: 2.1;
-  direction: rtl; text-align: right; margin: 6px 0 0; overflow-x: auto; white-space: nowrap; }
-.nq-unsure { background: var(--nq-gold-wash); border-radius: 2px;
-  text-decoration: underline dotted var(--nq-gold); text-decoration-thickness: 3px;
-  text-underline-offset: .42em; text-decoration-skip-ink: none; }
+  direction: rtl; text-align: right; margin: 6px 0 0; overflow: visible; white-space: normal;
+  overflow-wrap: anywhere; }
+.nq-unsure { color: var(--nq-gold); text-decoration: underline dotted var(--nq-gold);
+  text-decoration-thickness: 3px; text-underline-offset: .45em; text-decoration-skip-ink: none; }
 .nq-models { display: grid; grid-template-columns: 4.5rem 1fr; gap: 0 10px; margin-top: 4px;
-  font-size: .9rem; color: var(--nq-faded); }
+  align-items: baseline; font-size: .9rem; color: var(--nq-faded); }
 .nq-models .nq-text { font-size: 1.4rem; line-height: 1.9; margin: 0; color: var(--nq-faded); }
 .nq-faint { color: var(--nq-faded); font-style: italic; }
 .nq-empty { padding: 28px 4px; color: var(--nq-faded); font-size: 1.08rem; line-height: 1.6; max-width: 46ch; }
@@ -566,12 +593,13 @@ CSS = """
 """
 
 
-def render_html(crops, results, seconds, method, show_models, script="ajami"):
+def render_html(crops, results, seconds, method, show_models, script="ajami", use_lm=True):
     lang = PROFILES.get(script, PROFILES["ajami"])["lang"]
     n = len(results)
     parts = [f'<div class="nq-read"><p class="nq-summary">Read {n} line{"s" if n != 1 else ""} '
-             f'in {seconds:.1f} seconds; lines found by {html.escape(method)}. A dotted blue line '
-             f'under a letter means the recognisers disagreed about it: check those letters against '
+             f'in {seconds:.1f} seconds; lines found by {html.escape(method)}'
+             f'{"" if use_lm else ", using the tested system only"}. A letter in blue with '
+             f'dots beneath it means the recognisers disagreed about it: check those letters against '
              f'the manuscript.</p>']
     for k, (crop, r) in enumerate(zip(crops, results), 1):
         models = ""
@@ -605,7 +633,7 @@ def standalone_page(body):
 # one page, end to end
 # ---------------------------------------------------------------------------
 
-def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajami"):
+def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajami", use_lm=True):
     img = ImageOps.exif_transpose(img).convert("RGB")
     W, H = img.size
     if mode == "single" or (mode == "auto" and looks_like_single_line(img)):
@@ -623,7 +651,7 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
              if x1 - x0 > 10 and y1 - y0 > 8][:MAX_LINES]
     crops = [img.crop(b) for b in boxes]
     t0 = time.time()
-    results = reader.read(crops, script)
+    results = reader.read(crops, script, use_lm)
     seconds = time.time() - t0
     text = "\n".join(r["text"] for r in results)
     return boxes, crops, results, seconds, method, text
@@ -725,12 +753,15 @@ FOOT = """
   <li>It finds the lines of text on the page.</li>
   <li>Several recognisers of different kinds read every line: three for Ajami, four for Arabic.</li>
   <li>A vote combines their readings letter by letter, trusting each by its confidence.</li>
-  <li>Letters the recognisers disputed are underlined with blue dots.</li>
+  <li>A language model learned from the training transcriptions helps the vote prefer real words.
+  It only chooses among letters the recognisers proposed; it never invents text.</li>
+  <li>Letters the recognisers disputed are shown in blue, with dots beneath them.</li>
 </ol>
 <p><strong>How well it reads.</strong> On manuscript lines held out from training it made fewer
 errors than the published systems: a character error rate of 10.42% on Ajami, where the published
 benchmark is 10.66%, and 10.12% on historical Arabic, where the dataset authors' system reached
-12.36% on the same lines.</p>
+12.36% on the same lines. With the language model, validation error fell further, from 10.83% to
+9.35% on Arabic and from 9.80% to 9.57% on Ajami.</p>
 <p>A research prototype from a final-year project in the Department of Computer Science, University
 of Ibadan, by Bashir Sekinat Omotoke, supervised by Dr O. A. Abiola. It reads clean scans similar to
 its training manuscripts best; check important readings against the original.</p>
@@ -751,14 +782,15 @@ def build_app(reader, kraken_bin):
     available = getattr(reader, "scripts", {"ajami": None})
     scripts = {PROFILES[k]["label"]: k for k in PROFILES if k in available}
 
-    def run(image, script_label, mode_label, show_models):
+    def run(image, script_label, mode_label, lm_on, show_models):
         if image is None:
             return None, EMPTY, ""
         script = scripts.get(script_label, "ajami")
         notes = []
         try:
             boxes, crops, results, secs, method, text = read_page(
-                reader, image, modes[mode_label], kraken_bin, log=notes.append, script=script)
+                reader, image, modes[mode_label], kraken_bin, log=notes.append, script=script,
+                use_lm=bool(lm_on))
         except Exception as e:                              # noqa: BLE001
             return None, (f'<div class="nq-empty">Reading stopped with an error: '
                           f'{html.escape(repr(e))}. Try "The image is one line" for a single '
@@ -766,7 +798,7 @@ def build_app(reader, kraken_bin):
         if not results:
             return image, ('<div class="nq-empty">No lines of text were found on this image. '
                            'Crop it to the text, or choose "The image is one line".</div>'), ""
-        body = render_html(crops, results, secs, method, show_models, script)
+        body = render_html(crops, results, secs, method, show_models, script, bool(lm_on))
         return draw_boxes(image, boxes), body, text
 
     with warnings.catch_warnings():
@@ -783,8 +815,12 @@ def build_app(reader, kraken_bin):
                                label="Script")
                 mode = _make(gr.Radio, choices=list(modes), value="Automatic",
                              label="How to find the lines")
-                show = _make(gr.Checkbox, value=False, label="Show each recogniser's reading")
                 go = _make(gr.Button, "Read the page", variant="primary", elem_id="nq-read-btn")
+                with _make(gr.Accordion, "Advanced options", open=False):
+                    lm_on = _make(gr.Checkbox, value=True,
+                                  label="Prefer readings that form real words (recommended). "
+                                        "Untick to use the system exactly as it was tested.")
+                    show = _make(gr.Checkbox, value=False, label="Show each recogniser's reading")
         with gr.Row(equal_height=False):
             with gr.Column(scale=3):
                 boxed = _make(gr.Image, type="pil", label="Lines found", interactive=False)
@@ -793,7 +829,7 @@ def build_app(reader, kraken_bin):
         txt = _make(gr.Textbox, label="The text, to copy", lines=8, rtl=True,
                     show_copy_button=True, buttons=["copy"], elem_id="nq-copy")
         gr.HTML(FOOT, elem_id="nq-foot")
-        go.click(run, inputs=[inp, script, mode, show], outputs=[boxed, out, txt])
+        go.click(run, inputs=[inp, script, mode, lm_on, show], outputs=[boxed, out, txt])
     return demo
 
 
@@ -863,7 +899,7 @@ def _self_test():
     class FakeReader:
         scripts = {"ajami": None, "arabic": None}
 
-        def read(self, images, script="ajami"):
+        def read(self, images, script="ajami", use_lm=True):
             return [{"text": "بَرࣸ دࣸࢽْ", "unsure": [False, True, False, False, False, False, False],
                      "models": {m: "بَرࣸ" for m in PROFILES[script]["order"]}} for _ in images]
 
@@ -896,6 +932,16 @@ def _self_test():
           "mirrored CRNN output returned to logical order")
     html_ar = render_html(crops, FakeReader().read(crops, "arabic"), 1.0, "a test", True, "arabic")
     assert 'lang="ar"' in html_ar and html_ar.count('class="nq-line"') == 6
+    # the language-model vote: lam 0 reproduces the evaluated vote; proposals only
+    from lm_vote import KNLM, lm_decode
+    lm = KNLM.from_texts(["سلام كتير حار وقلب مشتاق"] * 20 + ["كلنا بالصحة الحمدلله"] * 20, order=5)
+    per = {"crnn1": [("سلام كتير", [0.9] * 9)], "crnn3": [("سلام كشر", [0.6] * 8)],
+           "crnn2": [("سلام كتير", [0.5] * 9)], "trocr": [("سلام كثير", [0.7] * 9)]}
+    plain = combine(per, PROFILES["arabic"]["order"], 1)[0]
+    with_lm = combine(per, PROFILES["arabic"]["order"], 1, lm, PROFILES["arabic"]["lm"])[0]
+    assert with_lm["text"] == "سلام كتير" and len(with_lm["unsure"]) == len(with_lm["text"])
+    assert lm_decode([Hypothesis(n, t, c) for n, (t, c) in [(k, v[0]) for k, v in per.items()]], lm, lam=0.0, gap_bias=0.0, beam=1)[0] == plain["text"]
+    print("language-model vote: picks the word the training lines support; lam 0 equals the evaluated vote")
     print("all lens self-tests passed")
 
 
