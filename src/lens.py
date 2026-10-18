@@ -1,27 +1,36 @@
 """
 lens.py
 -------
-Ajami Lens: point it at a manuscript page and it reads the page.
+Iʿjām (إعجام, "the dots that tell letters apart"): point it at a manuscript
+page and it reads the page. Formerly the Ajami Lens. Iʿjām shares its Arabic
+root, ʿ-j-m, with "Ajami".
 
-  page image -> find the lines -> CRNN-1, CRNN-2 and TrOCR read every line
-             -> the confidence vote combines them (the final system of the
-                evaluation) -> the page with each line boxed, beside the text,
-                with characters the models disagreed on highlighted.
+  page image -> find the lines -> every model of the chosen script reads every
+             line -> the confidence vote combines them (the final system of
+             the evaluation) -> the page with each line boxed, beside the
+             text, with the characters the models disputed marked by blue dots.
 
-Line finding is not part of the evaluated system: the corpus came with line
-boxes. The Lens uses Kraken's pretrained page segmenter when available (run
+Two scripts, each with exactly the members and member order of its evaluated
+final system:
+  Ajami  : CRNN-1, CRNN-2, TrOCR            (test CER 10.42%, benchmark 10.66%)
+  Arabic : CRNN-1, CRNN-3, CRNN-2, TrOCR    (test CER 10.17%; 10.12% against
+           12.36% for the published system on the lines both read)
+
+Line finding is not part of the evaluated system: both corpora came with line
+boxes. Iʿjām uses Kraken's pretrained page segmenter when available (run
 from its own environment, because Kraken and TrOCR need incompatible library
 versions), and falls back to a simple projection-profile segmenter that suits
-clean single-column scans. Recognition uses exactly the preprocessing,
-models and ensemble rule that produced the 10.42% test result.
+clean single-column scans. Recognition uses exactly the preprocessing, models
+and ensemble rule that produced the reported test results.
 
 Usage
   python lens.py --self-test                      # no models needed
-  python lens.py --models /content/models --image page.png --out lens.html
+  python lens.py --models /content/models --image page.png --script arabic --out read.html
   python lens.py --models /content/models --kraken-bin /content/kenv/bin/kraken --share
 
---models must contain crnn1/, crnn2/ and trocr/ (each a downloaded Kaggle
-notebook output).
+--models must contain crnn1/, crnn2/ and trocr/ (Ajami) and may contain
+arabic/crnn1/, arabic/crnn2/, arabic/crnn3/ and arabic/trocr/ (Arabic). Each
+CRNN folder holds best.pt and alphabet.json; each TrOCR folder a saved model.
 """
 
 from __future__ import annotations
@@ -48,8 +57,18 @@ from alignment import GAP, Hypothesis, apply_constraints, build_network, candida
 
 HEIGHT = 64            # CRNN input height, as trained
 MAX_WIDTH = 1600       # CRNN width cap, as trained (dataset.MAX_WIDTH)
-MAX_LEN = 128          # TrOCR generation limit, as trained
-MODEL_ORDER = ["crnn1", "crnn2", "trocr"]   # order used by ensemble.py (vote ties)
+# Each script's evaluated final system. "order" is the member order that
+# ensemble.py used when it scored the test set; it decides vote ties, so it is
+# kept exactly. "bidi" marks CRNNs trained with --bidi-runs, whose output is in
+# mirrored-scan order and is put back into logical order (bidi_order.py).
+PROFILES = {
+    "ajami": {"label": "Ajami (Hausa, Fulfulde)", "dir": "", "crnns": ["crnn1", "crnn2"],
+              "order": ["crnn1", "crnn2", "trocr"], "max_len": 128, "bidi": False,
+              "lang": "ha-Arab"},
+    "arabic": {"label": "Arabic", "dir": "arabic", "crnns": ["crnn1", "crnn2", "crnn3"],
+               "order": ["crnn1", "crnn3", "crnn2", "trocr"], "max_len": 256, "bidi": True,
+               "lang": "ar"},
+}
 MAX_LINES = 60         # a public server must not be tied up by one huge image
 
 
@@ -320,39 +339,36 @@ def _find(root, name):
     return hits[0]
 
 
-class Reader:
-    """Loads CRNN-1, CRNN-2 and TrOCR once; reads lists of line images."""
+class _Script:
+    """One script's members: its CRNNs and its TrOCR, loaded once."""
 
-    def __init__(self, models_dir, device=None):
-        import torch
+    def __init__(self, key, root, device, torch):
         from alphabet import Alphabet
         from crnn import CRNN
-        self.torch = torch
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        root = Path(models_dir)
+        from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel
+        from train_trocr import configure_special_tokens
+        self.key, self.profile, self.device, self.torch = key, PROFILES[key], device, torch
         self.crnns = []
-        for name in ("crnn1", "crnn2"):
+        for name in self.profile["crnns"]:
             alphabet = Alphabet.load(_find(root / name, "alphabet.json"))
-            ckpt = torch.load(_find(root / name, "best.pt"), map_location=self.device)
-            model = CRNN(n_classes=alphabet.size_with_blank, input_height=HEIGHT).to(self.device)
+            ckpt = torch.load(_find(root / name, "best.pt"), map_location=device)
+            model = CRNN(n_classes=alphabet.size_with_blank, input_height=HEIGHT).to(device)
             model.load_state_dict(ckpt["model"])
             model.eval()
             self.crnns.append((name, model, alphabet))
-            print(f"loaded {name} (epoch {ckpt.get('epoch')})")
-
-        from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel
-        from train_trocr import configure_special_tokens
-        best = next((p.parent for p in sorted((root / "trocr").rglob("config.json"))
-                     if p.parent.name == "best"), None) or _find(root / "trocr", "config.json").parent
+            print(f"{key}: loaded {name} (epoch {ckpt.get('epoch')})")
+        best = next((q.parent for q in sorted((root / "trocr").rglob("config.json"))
+                     if q.parent.name == "best"), None) or _find(root / "trocr", "config.json").parent
         self.tok = AutoTokenizer.from_pretrained(best)
         self.proc = AutoImageProcessor.from_pretrained(best)
-        self.trocr = VisionEncoderDecoderModel.from_pretrained(best).to(self.device)
-        configure_special_tokens(self.trocr, self.tok, MAX_LEN)
+        self.trocr = VisionEncoderDecoderModel.from_pretrained(best).to(device)
+        configure_special_tokens(self.trocr, self.tok, self.profile["max_len"])
         self.trocr.eval()
-        print(f"loaded trocr from {best} on {self.device}")
+        print(f"{key}: loaded trocr from {best} on {device}")
 
     def _read_crnn(self, model, alphabet, images):
         from predict import ctc_decode_with_confidence
+        from bidi_order import mirror_order_with_confidence
         torch = self.torch
         arrays, widths = [], []
         for im in images:
@@ -369,7 +385,10 @@ class Reader:
         out = []
         for i, w in enumerate(widths):
             T = model.output_length(w)
-            out.append(ctc_decode_with_confidence(probs[:T, i, :], alphabet.index_to_char))
+            text, conf = ctc_decode_with_confidence(probs[:T, i, :], alphabet.index_to_char)
+            if self.profile["bidi"]:
+                text, conf = mirror_order_with_confidence(text, conf)
+            out.append((text, conf))
         return out
 
     def _read_trocr(self, images, chunk=8):
@@ -380,35 +399,59 @@ class Reader:
             pix = self.proc(part, return_tensors="pt").pixel_values
             batch = {"pixel_values": pix, "image_ids": [""] * len(part),
                      "texts": [""] * len(part), "langs": [""] * len(part)}
-            for r in predict(self.trocr, self.tok, [batch], self.device, MAX_LEN):
+            for r in predict(self.trocr, self.tok, [batch], self.device, self.profile["max_len"]):
                 out.append((r["prediction"], json.loads(r["confidence"])))
         return out
 
     def read(self, images):
+        per_model = {name: self._read_crnn(model, alphabet, images)
+                     for name, model, alphabet in self.crnns}
+        per_model["trocr"] = self._read_trocr(images)
+        return combine(per_model, self.profile["order"], len(images))
+
+
+def combine(per_model, order, n):
+    """The evaluated vote over each line's readings, members in evaluation order."""
+    results = []
+    for i in range(n):
+        hyps = []
+        for name in order:
+            text, conf = per_model[name][i]
+            conf = (list(conf) + [0.5] * len(text))[: len(text)]
+            hyps.append(Hypothesis(name, text, conf))
+        text, flags = ensemble_line(hyps)
+        results.append({"text": text, "unsure": flags,
+                        "models": {h.model: h.text for h in hyps}})
+    return results
+
+
+class Reader:
+    """Loads every script whose models are present; reads lists of line images."""
+
+    def __init__(self, models_dir, device=None):
+        import torch
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        root = Path(models_dir)
+        self.scripts = {}
+        for key, profile in PROFILES.items():
+            sub = root / profile["dir"] if profile["dir"] else root
+            if all((sub / name).exists() for name in profile["crnns"] + ["trocr"]):
+                self.scripts[key] = _Script(key, sub, self.device, torch)
+        if not self.scripts:
+            raise SystemExit(f"no complete set of models under {root}")
+
+    def read(self, images, script="ajami"):
         if not images:
             return []
-        per_model = {}
-        for name, model, alphabet in self.crnns:
-            per_model[name] = self._read_crnn(model, alphabet, images)
-        per_model["trocr"] = self._read_trocr(images)
-        results = []
-        for i in range(len(images)):
-            hyps = []
-            for name in MODEL_ORDER:
-                text, conf = per_model[name][i]
-                conf = (list(conf) + [0.5] * len(text))[: len(text)]
-                hyps.append(Hypothesis(name, text, conf))
-            text, flags = ensemble_line(hyps)
-            results.append({"text": text, "unsure": flags,
-                            "models": {h.model: h.text for h in hyps}})
-        return results
+        return self.scripts[script].read(images)
 
 
 # ---------------------------------------------------------------------------
 # presentation
 # ---------------------------------------------------------------------------
 
-ACCENT = (31, 95, 191)
+GOLD = (36, 87, 197)       # the box colour: lapis blue
+INK = (16, 32, 63)         # ink navy
 
 
 def draw_boxes(img, boxes):
@@ -421,25 +464,23 @@ def draw_boxes(img, boxes):
     except TypeError:
         font = ImageFont.load_default()
     for n, (x0, y0, x1, y1) in enumerate(boxes, 1):
-        d.rectangle([x0, y0, x1, y1], outline=ACCENT, width=lw)
+        d.rectangle([x0, y0, x1, y1], outline=GOLD, width=lw)
         label = str(n)
         tw = size * (0.6 * len(label) + 0.6)
-        d.rectangle([x1 - tw, y0, x1, y0 + size * 1.3], fill=ACCENT)
+        d.rectangle([x1 - tw, y0, x1, y0 + size * 1.3], fill=GOLD)
         d.text((x1 - tw + size * 0.3, y0 + size * 0.1), label, fill="white", font=font)
     return im
 
 
-def _thumb(img, max_w=900):
-    im = img.convert("RGB")
-    if im.width > max_w:
-        im = im.resize((max_w, max(1, int(im.height * max_w / im.width))), Image.LANCZOS)
+def _image_uri(img):
+    """A line image as a lossless PNG at its own resolution (no downscaling)."""
     buf = io.BytesIO()
-    im.save(buf, format="JPEG", quality=85)
-    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    img.convert("RGB").save(buf, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
 def highlight(text, flags):
-    """Uncertain characters in amber; a letter and its marks stay together."""
+    """Disputed characters get blue dots beneath; a letter and its marks stay together."""
     out, k = [], 0
     while k < len(text):
         s = k
@@ -447,59 +488,124 @@ def highlight(text, flags):
         while k < len(text) and unicodedata.category(text[k]).startswith("M"):
             k += 1
         piece = html.escape(text[s:k]).replace(" ", "&nbsp;")
-        out.append(f'<span class="unsure">{piece}</span>' if any(flags[s:k]) else piece)
-    return "".join(out) or '<span class="muted">(nothing read)</span>'
+        out.append(f'<span class="nq-unsure">{piece}</span>' if any(flags[s:k]) else piece)
+    return "".join(out) or '<span class="nq-faint">Nothing was read on this line.</span>'
 
+
+FONTS = ("https://fonts.googleapis.com/css2?family=Aref+Ruqaa:wght@400;700"
+         "&family=Gentium+Book+Plus:ital,wght@0,400;0,700;1,400"
+         "&family=Scheherazade+New:wght@400;500;600&family=Amiri&family=Noto+Naskh+Arabic:wght@400;600"
+         "&family=Noto+Sans:wght@400;600&display=swap")
 
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Noto+Naskh+Arabic&family=Noto+Sans+Arabic&display=swap');
-.lens { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
-.lens .summary { margin: 0 0 12px; opacity: .8; }
-.lens .line { border: 1px solid rgba(127,127,127,.3); border-radius: 10px; padding: 10px 12px; margin: 0 0 12px; }
-.lens .num { font-weight: 600; margin-bottom: 6px; }
-.lens img { max-width: 100%; height: auto; display: block; border-radius: 6px; margin-bottom: 8px; background: #fff; }
-.lens .ajami { font-family: 'Noto Naskh Arabic', 'Noto Sans Arabic', 'Segoe UI', Arial, serif;
-  font-size: 1.5rem; line-height: 2.1; direction: rtl; text-align: right; overflow-x: auto; white-space: nowrap; }
-.lens .unsure { background: rgba(255, 179, 0, .35); border-radius: 3px; }
-.lens .models { margin-top: 6px; font-size: .9rem; }
-.lens .models div { display: grid; grid-template-columns: 70px 1fr; gap: 8px; align-items: center; }
-.lens .models .ajami { font-size: 1.15rem; line-height: 1.9; }
-.lens .muted { opacity: .6; }
+@import url('""" + FONTS + """');
+:root, .light {
+  --nq-folio: #FFFFFF;   --nq-leaf: #F5F8FD;   --nq-ink: #10203F;
+  --nq-faded: #5A6B8C;   --nq-rubric: #2457C5; --nq-gold: #2457C5;
+  --nq-gold-wash: rgba(36, 87, 197, .14);     --nq-rule: #D6E0F0;
+}
+.dark {
+  --nq-folio: #0E1730;   --nq-leaf: #16223F;   --nq-ink: #EAF0FA;
+  --nq-faded: #A9B8D6;   --nq-rubric: #8FB3FF; --nq-gold: #8FB3FF;
+  --nq-gold-wash: rgba(143, 179, 255, .22);   --nq-rule: #2B3A5E;
+}
+.gradio-container { background: var(--nq-folio) !important; color: var(--nq-ink);
+  font-family: 'Gentium Book Plus', Georgia, serif; max-width: 1180px !important; }
+.gradio-container button, .gradio-container input, .gradio-container label,
+.gradio-container .block-label, .gradio-container span.svelte-1gfkn6j {
+  font-family: 'Noto Sans', system-ui, sans-serif; }
+
+/* the masthead: the wordmark is the one bold thing on the page */
+#nq-head { padding: 28px 4px 6px; }
+#nq-head .nq-mark { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
+#nq-head .nq-ar { font-family: 'Aref Ruqaa', 'Noto Naskh Arabic', serif; font-size: 4.6rem;
+  line-height: 1; color: var(--nq-gold); direction: rtl; }
+#nq-head .nq-lat { font-size: 2.6rem; line-height: 1.05; color: var(--nq-ink); letter-spacing: .01em; }
+#nq-head .nq-lat small { display: block; font-size: 1.02rem; font-style: italic; color: var(--nq-faded);
+  letter-spacing: 0; margin-top: 6px; }
+#nq-head .nq-lede { max-width: 62ch; font-size: 1.12rem; line-height: 1.6; margin: 14px 0 0; }
+
+/* the reading */
+.nq-read { font-family: 'Gentium Book Plus', Georgia, serif; color: var(--nq-ink); }
+.nq-read .nq-summary { font-size: 1rem; line-height: 1.55; margin: 0 0 18px; color: var(--nq-faded);
+  max-width: 64ch; }
+.nq-line { display: grid; grid-template-columns: 2.6rem 1fr; gap: 4px 14px; padding: 14px 0;
+  border-top: 1px solid var(--nq-rule); }
+.nq-line:first-of-type { border-top: 0; }
+.nq-num { grid-row: span 3; font-size: 1.35rem; color: var(--nq-rubric); text-align: right;
+  padding-top: 2px; font-variant-numeric: oldstyle-nums; }
+.nq-line img { max-width: 100%; height: auto; display: block; border-radius: 2px;
+  box-shadow: 0 0 0 1px var(--nq-rule); background: #fff; }
+.nq-text { font-family: 'Scheherazade New', 'Amiri', 'Noto Naskh Arabic', serif; font-size: 1.95rem; line-height: 2.1;
+  direction: rtl; text-align: right; margin: 6px 0 0; overflow-x: auto; white-space: nowrap; }
+.nq-unsure { background: var(--nq-gold-wash); border-radius: 2px;
+  text-decoration: underline dotted var(--nq-gold); text-decoration-thickness: 3px;
+  text-underline-offset: .42em; text-decoration-skip-ink: none; }
+.nq-models { display: grid; grid-template-columns: 4.5rem 1fr; gap: 0 10px; margin-top: 4px;
+  font-size: .9rem; color: var(--nq-faded); }
+.nq-models .nq-text { font-size: 1.4rem; line-height: 1.9; margin: 0; color: var(--nq-faded); }
+.nq-faint { color: var(--nq-faded); font-style: italic; }
+.nq-empty { padding: 28px 4px; color: var(--nq-faded); font-size: 1.08rem; line-height: 1.6; max-width: 46ch; }
+
+/* the desk: quiet controls, one inked action */
+#nq-read-btn { background: var(--nq-gold) !important; color: #FFFFFF !important;
+  border: 0 !important; font-size: 1.02rem !important; letter-spacing: .01em; }
+.dark #nq-read-btn { color: #0E1730 !important; }
+#nq-read-btn::before { content: ""; display: inline-block; width: .55em; height: .55em;
+  border-radius: 50%; background: currentColor; margin-right: .6em; vertical-align: .08em; }
+#nq-read-btn:focus-visible { outline: 3px solid var(--nq-gold) !important; outline-offset: 2px; }
+#nq-copy textarea { font-family: 'Scheherazade New', 'Amiri', 'Noto Naskh Arabic', serif !important;
+  font-size: 1.55rem !important; line-height: 2 !important; }
+#nq-foot { font-size: .98rem; line-height: 1.6; color: var(--nq-faded); max-width: 70ch; }
+#nq-foot ol { padding-left: 1.3em; }
+#nq-foot strong { color: var(--nq-ink); font-weight: 700; }
+@media (max-width: 640px) {
+  #nq-head .nq-ar { font-size: 3.4rem; }  #nq-head .nq-lat { font-size: 2rem; }
+  .nq-text { font-size: 1.6rem; }
+}
 """
 
 
-def render_html(crops, results, seconds, method, show_models):
-    parts = [f'<div class="lens"><p class="summary">{len(results)} line(s) read in '
-             f'{seconds:.1f} s · lines found by {html.escape(method)} · '
-             f'<span class="unsure">&nbsp;highlighted&nbsp;</span> = the models '
-             f'disagreed; check these characters.</p>']
-    for n, (crop, r) in enumerate(zip(crops, results), 1):
+def render_html(crops, results, seconds, method, show_models, script="ajami"):
+    lang = PROFILES.get(script, PROFILES["ajami"])["lang"]
+    n = len(results)
+    parts = [f'<div class="nq-read"><p class="nq-summary">Read {n} line{"s" if n != 1 else ""} '
+             f'in {seconds:.1f} seconds; lines found by {html.escape(method)}. A dotted blue line '
+             f'under a letter means the recognisers disagreed about it: check those letters against '
+             f'the manuscript.</p>']
+    for k, (crop, r) in enumerate(zip(crops, results), 1):
         models = ""
         if show_models:
-            models = '<div class="models">' + "".join(
-                f'<div><span class="muted">{name}</span>'
-                f'<span class="ajami">{html.escape(t).replace(" ", "&nbsp;") or "—"}</span></div>'
+            models = '<div class="nq-models">' + "".join(
+                f'<span>{html.escape(name)}</span>'
+                f'<p class="nq-text" lang="{lang}">{html.escape(t).replace(" ", "&nbsp;") or "—"}</p>'
                 for name, t in r["models"].items()) + "</div>"
-        parts.append(f'<div class="line"><div class="num">Line {n}</div>'
-                     f'<img src="{_thumb(crop)}" alt="line {n}">'
-                     f'<div class="ajami" lang="ha-Arab">{highlight(r["text"], r["unsure"])}</div>'
+        parts.append(f'<div class="nq-line"><div class="nq-num">{k}</div>'
+                     f'<img src="{_image_uri(crop)}" alt="Line {k} of the page">'
+                     f'<p class="nq-text" lang="{lang}">{highlight(r["text"], r["unsure"])}</p>'
                      f'{models}</div>')
     parts.append("</div>")
     return "".join(parts)
 
 
+EMPTY = ('<div class="nq-empty">Upload a photo or scan of a manuscript page, or of a single line, '
+         'choose its script, and read the page. The transcription appears here, line by line.</div>')
+
+
 def standalone_page(body):
     return ("<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-            f"<title>Ajami Lens</title><style>{CSS} body{{max-width:1000px;margin:24px auto;"
-            f"padding:0 16px}}</style></head><body><h1>Ajami Lens</h1>{body}</body></html>")
+            f"<title>Iʿjām</title><style>{CSS} body{{max-width:1000px;margin:24px auto;"
+            "padding:0 16px;background:var(--nq-folio)}}</style></head><body>"
+            "<h1 style=\"font-family:'Gentium Book Plus',serif\">Iʿjām</h1>"
+            f"{body}</body></html>")
 
 
 # ---------------------------------------------------------------------------
 # one page, end to end
 # ---------------------------------------------------------------------------
 
-def read_page(reader, img, mode="auto", kraken_bin=None, log=print):
+def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajami"):
     img = ImageOps.exif_transpose(img).convert("RGB")
     W, H = img.size
     if mode == "single" or (mode == "auto" and looks_like_single_line(img)):
@@ -517,7 +623,7 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print):
              if x1 - x0 > 10 and y1 - y0 > 8][:MAX_LINES]
     crops = [img.crop(b) for b in boxes]
     t0 = time.time()
-    results = reader.read(crops)
+    results = reader.read(crops, script)
     seconds = time.time() - t0
     text = "\n".join(r["text"] for r in results)
     return boxes, crops, results, seconds, method, text
@@ -539,15 +645,96 @@ def _make(cls, *args, **kwargs):
             kwargs.pop(bad)
 
 
+def ijam_theme():
+    """Gradio theme in lapis blue and white; None if this Gradio lacks theming."""
+    try:
+        import gradio as gr
+        theme = gr.themes.Base(
+            font=[gr.themes.GoogleFont("Gentium Book Plus"), "Georgia", "serif"],
+            font_mono=["ui-monospace", "monospace"],
+            radius_size=gr.themes.sizes.radius_sm,
+        )
+        settings = dict(
+            body_background_fill="#FFFFFF", body_background_fill_dark="#0E1730",
+            body_text_color="#10203F", body_text_color_dark="#EAF0FA",
+            block_background_fill="#F5F8FD", block_background_fill_dark="#16223F",
+            block_border_color="#D6E0F0", block_border_color_dark="#2B3A5E",
+            block_label_text_color="#5A6B8C", block_label_text_color_dark="#A9B8D6",
+            input_background_fill="#FFFFFF", input_background_fill_dark="#121C36",
+            border_color_accent="#2457C5", border_color_accent_dark="#8FB3FF",
+            color_accent_soft="rgba(36,87,197,.14)", color_accent_soft_dark="rgba(143,179,255,.2)",
+            button_primary_background_fill="#2457C5", button_primary_background_fill_dark="#8FB3FF",
+            button_primary_background_fill_hover="#1B46A3",
+            button_primary_text_color="#FFFFFF", button_primary_text_color_dark="#0E1730",
+        )
+        for key, value in settings.items():          # skip any this version lacks
+            try:
+                theme.set(**{key: value})
+            except Exception:                         # noqa: BLE001
+                pass
+        return theme
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
+def favicon_path():
+    """A blue dot on white: the app's icon, also used when it is installed."""
+    path = Path(tempfile.gettempdir()) / "ijam_icon.png"
+    if not path.exists():
+        im = Image.new("RGB", (512, 512), (255, 255, 255))
+        d = ImageDraw.Draw(im)
+        d.ellipse([136, 136, 376, 376], fill=GOLD)
+        im.save(path)
+    return str(path)
+
+
 def launch(demo, **kwargs):
     """
-    Start the app. Gradio 6 takes the page styling in launch(); older
-    versions took it in Blocks(), where build_app already passed it.
+    Start the app. Gradio 6 takes styling in launch(), older versions in
+    Blocks() (where build_app already passed it). pwa=True lets visitors install
+    Iʿjām as an app; options this Gradio lacks are dropped one by one.
     """
-    try:
-        demo.launch(css=CSS, **kwargs)
-    except TypeError:
-        demo.launch(**kwargs)
+    extras = {"css": CSS, "theme": ijam_theme(), "pwa": True, "favicon_path": favicon_path()}
+    if extras["theme"] is None:
+        extras.pop("theme")
+    while True:
+        try:
+            return demo.launch(**kwargs, **extras)
+        except TypeError as e:
+            bad = next((k for k in extras if f"'{k}'" in str(e)), None)
+            if bad is None:
+                raise
+            extras.pop(bad)
+
+
+HEAD = """
+<div id="nq-head-inner">
+  <div class="nq-mark">
+    <span class="nq-ar" lang="ar">إعجام</span>
+    <span class="nq-lat">Iʿjām<small>the dots that tell letters apart</small></span>
+  </div>
+  <p class="nq-lede">Reads handwritten Ajami and Arabic manuscripts line by line, and marks every
+  letter it is unsure of. In these scripts a single dot changes the letter, so Iʿjām shows you which
+  dots to check.</p>
+</div>
+"""
+
+FOOT = """
+<p><strong>How Iʿjām reads a page</strong></p>
+<ol>
+  <li>It finds the lines of text on the page.</li>
+  <li>Several recognisers of different kinds read every line: three for Ajami, four for Arabic.</li>
+  <li>A vote combines their readings letter by letter, trusting each by its confidence.</li>
+  <li>Letters the recognisers disputed are underlined with blue dots.</li>
+</ol>
+<p><strong>How well it reads.</strong> On manuscript lines held out from training it made fewer
+errors than the published systems: a character error rate of 10.42% on Ajami, where the published
+benchmark is 10.66%, and 10.12% on historical Arabic, where the dataset authors' system reached
+12.36% on the same lines.</p>
+<p>A research prototype from a final-year project in the Department of Computer Science, University
+of Ibadan, by Bashir Sekinat Omotoke, supervised by Dr O. A. Abiola. It reads clean scans similar to
+its training manuscripts best; check important readings against the original.</p>
+"""
 
 
 def build_app(reader, kraken_bin):
@@ -561,50 +748,52 @@ def build_app(reader, kraken_bin):
         modes["Kraken segmenter"] = "kraken"
     modes["Simple segmenter"] = "projection"
     modes["The image is one line"] = "single"
+    available = getattr(reader, "scripts", {"ajami": None})
+    scripts = {PROFILES[k]["label"]: k for k in PROFILES if k in available}
 
-    def run(image, mode_label, show_models):
+    def run(image, script_label, mode_label, show_models):
         if image is None:
-            return None, "<p>Upload a page or a line first.</p>", ""
+            return None, EMPTY, ""
+        script = scripts.get(script_label, "ajami")
         notes = []
         try:
             boxes, crops, results, secs, method, text = read_page(
-                reader, image, modes[mode_label], kraken_bin, log=notes.append)
+                reader, image, modes[mode_label], kraken_bin, log=notes.append, script=script)
         except Exception as e:                              # noqa: BLE001
-            return None, f"<p>Something went wrong: {html.escape(repr(e))}</p>", ""
+            return None, (f'<div class="nq-empty">Reading stopped with an error: '
+                          f'{html.escape(repr(e))}. Try "The image is one line" for a single '
+                          f'line, or crop the page to its text.</div>'), ""
         if not results:
-            return image, "<p>No lines were found on this image.</p>", ""
-        body = render_html(crops, results, secs, method, show_models)
+            return image, ('<div class="nq-empty">No lines of text were found on this image. '
+                           'Crop it to the text, or choose "The image is one line".</div>'), ""
+        body = render_html(crops, results, secs, method, show_models, script)
         return draw_boxes(image, boxes), body, text
 
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")          # Gradio 6: css belongs to launch()
-        blocks = _make(gr.Blocks, title="Ajami Lens", css=CSS)
+        warnings.simplefilter("ignore")          # Gradio 6: css and theme belong to launch()
+        blocks = _make(gr.Blocks, title="Iʿjām", css=CSS, theme=ijam_theme())
     with blocks as demo:
-        gr.Markdown(
-            "# Ajami Lens\n"
-            "Read a handwritten **Hausa or Fulfulde Ajami** manuscript. Upload a page (or one "
-            "line), press **Read**, and get the text.\n\n"
-            "Each line is read by three models (two CRNNs and an adapted TrOCR) and combined by "
-            "a confidence vote, the system that reached **10.42% character error rate** on a "
-            "held-out test set, below the published benchmark of 10.66%. Characters the models "
-            "disagreed on are highlighted: check those first.\n\n"
-            "*Research prototype from a University of Ibadan final-year project. It reads clean "
-            "scans of manuscripts similar to its training material best. On the free server a "
-            "full page can take a few minutes.*")
-        with gr.Row():
-            inp = _make(gr.Image, type="pil", label="Manuscript page or line",
-                        sources=["upload", "webcam", "clipboard"])
-            with gr.Column():
+        gr.HTML(HEAD, elem_id="nq-head")
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=3):
+                inp = _make(gr.Image, type="pil", label="Manuscript page or line",
+                            sources=["upload", "webcam", "clipboard"], height=440)
+            with gr.Column(scale=2):
+                script = _make(gr.Radio, choices=list(scripts), value=next(iter(scripts)),
+                               label="Script")
                 mode = _make(gr.Radio, choices=list(modes), value="Automatic",
                              label="How to find the lines")
-                show = _make(gr.Checkbox, value=False, label="Also show each model's reading")
-                go = _make(gr.Button, "Read", variant="primary")
-        with gr.Row():
-            boxed = _make(gr.Image, type="pil", label="Lines found")
-            out = gr.HTML()
+                show = _make(gr.Checkbox, value=False, label="Show each recogniser's reading")
+                go = _make(gr.Button, "Read the page", variant="primary", elem_id="nq-read-btn")
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=3):
+                boxed = _make(gr.Image, type="pil", label="Lines found", interactive=False)
+            with gr.Column(scale=4):
+                out = gr.HTML(EMPTY)
         txt = _make(gr.Textbox, label="The text, to copy", lines=8, rtl=True,
-                    show_copy_button=True)
-        go.click(run, inputs=[inp, mode, show], outputs=[boxed, out, txt])
+                    show_copy_button=True, buttons=["copy"], elem_id="nq-copy")
+        gr.HTML(FOOT, elem_id="nq-foot")
+        go.click(run, inputs=[inp, script, mode, show], outputs=[boxed, out, txt])
     return demo
 
 
@@ -621,7 +810,7 @@ def _self_test():
     for _ in range(300):
         base = "".join(rng.choice(alphabet + [" "]) for _ in range(rng.randint(5, 40)))
         hyps = []
-        for name in MODEL_ORDER:
+        for name in PROFILES["ajami"]["order"]:
             t = "".join(c for c in base if rng.random() > 0.08)
             hyps.append(Hypothesis(name, t, [round(rng.random(), 3) for _ in t]))
         text, flags = ensemble_line(hyps)
@@ -672,27 +861,53 @@ def _self_test():
     print("Kraken output parsed from ALTO and native JSON")
 
     class FakeReader:
-        def read(self, images):
+        scripts = {"ajami": None, "arabic": None}
+
+        def read(self, images, script="ajami"):
             return [{"text": "بَرࣸ دࣸࢽْ", "unsure": [False, True, False, False, False, False, False],
-                     "models": {m: "بَرࣸ" for m in MODEL_ORDER}} for _ in images]
+                     "models": {m: "بَرࣸ" for m in PROFILES[script]["order"]}} for _ in images]
 
     boxes, crops, results, secs, method, text = read_page(FakeReader(), page.convert("RGB"),
                                                           mode="projection")
     html_out = standalone_page(render_html(crops, results, secs, method, True))
-    assert html_out.count('class="line"') == 6 and "unsure" in html_out
+    assert html_out.count('class="nq-line"') == 6 and "nq-unsure" in html_out
     draw_boxes(page, boxes)
     print("page read end to end with a stand-in reader; HTML and boxed image rendered")
+
+    # Arabic: four members in evaluation order, and the mirrored-scan output of
+    # a --bidi-runs CRNN returned to logical order before the vote.
+    rng = random.Random(1)
+    order = PROFILES["arabic"]["order"]
+    assert order == ["crnn1", "crnn3", "crnn2", "trocr"]
+    for _ in range(300):
+        base = "".join(rng.choice(list("ابتثجحخدرسشصعفقكلمنهوي ١٢٣") + ["\u064e"])
+                       for _ in range(rng.randint(5, 40)))
+        per_model = {}
+        for name in order:
+            t = "".join(c for c in base if rng.random() > 0.08)
+            per_model[name] = [(t, [round(rng.random(), 3) for _ in t])]
+        got = combine(per_model, order, 1)[0]["text"]
+        want = reconcile([Hypothesis(nm, *per_model[nm][0]) for nm in order])
+        assert got == want, "the Arabic vote differs from the evaluated rule"
+    from bidi_order import mirror_order_with_confidence
+    text, conf = mirror_order_with_confidence("سنة 7591 م", list(range(10)))
+    assert text == "سنة 1957 م" and conf == [0, 1, 2, 3, 7, 6, 5, 4, 8, 9]
+    print("Arabic: four-member vote matches the evaluated rule on 300 cases; "
+          "mirrored CRNN output returned to logical order")
+    html_ar = render_html(crops, FakeReader().read(crops, "arabic"), 1.0, "a test", True, "arabic")
+    assert 'lang="ar"' in html_ar and html_ar.count('class="nq-line"') == 6
     print("all lens self-tests passed")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--models", help="folder with crnn1/, crnn2/ and trocr/")
+    ap.add_argument("--models", help="folder with crnn1/, crnn2/, trocr/ and optionally arabic/")
     ap.add_argument("--kraken-bin", default=None,
                     help="the kraken program in its own environment, e.g. /content/kenv/bin/kraken")
     ap.add_argument("--image", help="read one image and write an HTML page instead of the app")
     ap.add_argument("--mode", default="auto", choices=["auto", "kraken", "projection", "single"])
+    ap.add_argument("--script", default="ajami", choices=list(PROFILES))
     ap.add_argument("--out", default="lens_result.html")
     ap.add_argument("--share", action="store_true", help="public link for the web app")
     ap.add_argument("--self-test", action="store_true")
@@ -707,9 +922,9 @@ def main():
     if args.image:
         img = Image.open(args.image)
         boxes, crops, results, secs, method, text = read_page(reader, img, args.mode,
-                                                              args.kraken_bin)
-        Path(args.out).write_text(standalone_page(render_html(crops, results, secs, method, True)),
-                                  encoding="utf-8")
+                                                              args.kraken_bin, script=args.script)
+        Path(args.out).write_text(standalone_page(render_html(crops, results, secs, method, True,
+                                                              args.script)), encoding="utf-8")
         draw_boxes(img, boxes).save(Path(args.out).with_suffix(".boxes.jpg"))
         print(f"{len(results)} lines via {method} in {secs:.1f}s -> {args.out}")
         print(text)
