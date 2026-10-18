@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import re
 import difflib
 import html
 import io
@@ -291,6 +292,122 @@ def group_rows(boxes, overlap=0.5):
         else:
             rows.append(list(b))
     return [tuple(int(round(v)) for v in r) for r in sorted(rows, key=lambda r: r[1])]
+
+
+
+def refine_boxes(img, boxes):
+    """
+    Clean the segmenter's lines before reading them (display and reading only;
+    the evaluated system was given its lines).
+
+      1. A box much shorter than a typical line is a dot, a stroke or a sliver
+         of a neighbouring line: drop it.
+      2. A box lying mostly inside another box is a fragment of that line:
+         drop it.
+      3. A box that stops short of the ink on its row is widened, left and
+         right, to the ink, so no line is cut off before its end. Widening
+         stops at a gap wider than about one and a half line heights, so it
+         never runs into a second column.
+    """
+    if not boxes:
+        return []
+    heights = sorted(b[3] - b[1] for b in boxes)
+    med = max(8, heights[len(heights) // 2])
+    boxes = [b for b in boxes if (b[3] - b[1]) >= 0.45 * med]
+
+    def area(b):
+        return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+    kept = []
+    for i, b in enumerate(boxes):
+        inside = False
+        for j, o in enumerate(boxes):
+            if i == j or area(o) <= area(b):
+                continue
+            ix = max(0, min(b[2], o[2]) - max(b[0], o[0]))
+            iy = max(0, min(b[3], o[3]) - max(b[1], o[1]))
+            if ix * iy >= 0.6 * area(b):
+                inside = True
+                break
+        if not inside:
+            kept.append(b)
+
+    gray = np.asarray(img.convert("L"), dtype=np.uint8)
+    ink = gray <= otsu_threshold(gray)       # <=: the threshold value itself belongs to the ink class
+    W = ink.shape[1]
+    max_gap = int(1.5 * med)
+    out = []
+    for x0, y0, x1, y1 in kept:
+        h = y1 - y0
+        band = ink[y0 + h // 5: max(y0 + h // 5 + 1, y1 - h // 5), :]   # the core of the line
+        cols = band.sum(axis=0) > 0
+        gap, x = 0, x1
+        while x < W and gap <= max_gap:                    # widen to the right
+            gap = 0 if cols[x] else gap + 1
+            x += 1
+        nx1 = min(W, x - gap)
+        gap, x = 0, x0 - 1
+        while x >= 0 and gap <= max_gap:                   # widen to the left
+            gap = 0 if cols[x] else gap + 1
+            x -= 1
+        nx0 = max(0, x + 1 + gap)
+        out.append((min(x0, nx0), y0, max(x1, nx1), y1))
+    return sorted(out, key=lambda b: (b[1], -b[2]))
+
+
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+def tidy_line(text, flags):
+    """
+    Make a reading look like text (display only; the evaluated system is not
+    tidied): remove Latin letters, tokens made only of dots or other symbols,
+    and bare single letters standing alone (except و, a word in its own
+    right). Returns the tidied text and its flags, kept aligned.
+    """
+    pairs = [(c, f) for c, f in zip(text, flags) if not _LATIN.match(c)]
+    tokens, cur = [], []
+    for c, f in pairs:
+        if c == " ":
+            if cur:
+                tokens.append(cur)
+            cur = []
+        else:
+            cur.append((c, f))
+    if cur:
+        tokens.append(cur)
+
+    def keep(tok):
+        chars = "".join(c for c, _ in tok)
+        letters = [c for c in chars if unicodedata.category(c).startswith("L")]
+        marks = [c for c in chars if unicodedata.category(c).startswith("M")]
+        digits = [c for c in chars if unicodedata.category(c) == "Nd"]
+        if not letters and not digits:
+            return False                                   # dots, dashes, stray symbols
+        if len(letters) == 1 and not marks and not digits and letters[0] != "و":
+            return False                                   # a lone bare letter
+        return True
+
+    tokens = [t for t in tokens if keep(t)]
+    out_text, out_flags = [], []
+    for k, t in enumerate(tokens):
+        if k:
+            out_text.append(" ")
+            out_flags.append(False)
+        out_text += [c for c, _ in t]
+        out_flags += [f for _, f in t]
+    return "".join(out_text), out_flags
+
+
+def tidy_results(boxes, crops, results):
+    """Tidy every line and drop lines left with fewer than two letters."""
+    kept = []
+    for b, c, r in zip(boxes, crops, results):
+        text, flags = tidy_line(r["text"], r["unsure"])
+        if sum(1 for ch in text if unicodedata.category(ch).startswith("L")) < 2:
+            continue
+        kept.append((b, c, dict(r, text=text, unsure=flags)))
+    return [k[0] for k in kept], [k[1] for k in kept], [k[2] for k in kept]
 
 
 def looks_like_single_line(img):
@@ -633,7 +750,8 @@ def standalone_page(body):
 # one page, end to end
 # ---------------------------------------------------------------------------
 
-def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajami", use_lm=True):
+def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajami", use_lm=True,
+              tidy=True):
     img = ImageOps.exif_transpose(img).convert("RGB")
     W, H = img.size
     if mode == "single" or (mode == "auto" and looks_like_single_line(img)):
@@ -647,12 +765,16 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
         if not boxes:
             boxes, method = segment_projection(img), "the projection segmenter"
         boxes = group_rows(boxes)
+        if tidy:
+            boxes = refine_boxes(img, boxes)
     boxes = [(max(0, x0), max(0, y0), min(W, x1), min(H, y1)) for x0, y0, x1, y1 in boxes
              if x1 - x0 > 10 and y1 - y0 > 8][:MAX_LINES]
     crops = [img.crop(b) for b in boxes]
     t0 = time.time()
     results = reader.read(crops, script, use_lm)
     seconds = time.time() - t0
+    if tidy:
+        boxes, crops, results = tidy_results(boxes, crops, results)
     text = "\n".join(r["text"] for r in results)
     return boxes, crops, results, seconds, method, text
 
@@ -782,7 +904,7 @@ def build_app(reader, kraken_bin):
     available = getattr(reader, "scripts", {"ajami": None})
     scripts = {PROFILES[k]["label"]: k for k in PROFILES if k in available}
 
-    def run(image, script_label, mode_label, lm_on, show_models):
+    def run(image, script_label, mode_label, lm_on, tidy_on, show_models):
         if image is None:
             return None, EMPTY, ""
         script = scripts.get(script_label, "ajami")
@@ -790,7 +912,7 @@ def build_app(reader, kraken_bin):
         try:
             boxes, crops, results, secs, method, text = read_page(
                 reader, image, modes[mode_label], kraken_bin, log=notes.append, script=script,
-                use_lm=bool(lm_on))
+                use_lm=bool(lm_on), tidy=bool(tidy_on))
         except Exception as e:                              # noqa: BLE001
             return None, (f'<div class="nq-empty">Reading stopped with an error: '
                           f'{html.escape(repr(e))}. Try "The image is one line" for a single '
@@ -820,6 +942,9 @@ def build_app(reader, kraken_bin):
                     lm_on = _make(gr.Checkbox, value=True,
                                   label="Prefer readings that form real words (recommended). "
                                         "Untick to use the system exactly as it was tested.")
+                    tidy = _make(gr.Checkbox, value=True,
+                                 label="Tidy the output: skip dots and specks, widen lines to their full "
+                                       "length, hide stray Latin letters and lone letters")
                     show = _make(gr.Checkbox, value=False, label="Show each recogniser's reading")
         with gr.Row(equal_height=False):
             with gr.Column(scale=3):
@@ -829,7 +954,7 @@ def build_app(reader, kraken_bin):
         txt = _make(gr.Textbox, label="The text, to copy", lines=8, rtl=True,
                     show_copy_button=True, buttons=["copy"], elem_id="nq-copy")
         gr.HTML(FOOT, elem_id="nq-foot")
-        go.click(run, inputs=[inp, script, mode, lm_on, show], outputs=[boxed, out, txt])
+        go.click(run, inputs=[inp, script, mode, lm_on, tidy, show], outputs=[boxed, out, txt])
     return demo
 
 
@@ -942,6 +1067,23 @@ def _self_test():
     assert with_lm["text"] == "سلام كتير" and len(with_lm["unsure"]) == len(with_lm["text"])
     assert lm_decode([Hypothesis(n, t, c) for n, (t, c) in [(k, v[0]) for k, v in per.items()]], lm, lam=0.0, gap_bias=0.0, beam=1)[0] == plain["text"]
     print("language-model vote: picks the word the training lines support; lam 0 equals the evaluated vote")
+
+    # tidying: dots, Latin letters and lone letters go; real words and flags stay aligned
+    t, f = tidy_line("1 M . .. ..11", [False] * 13)
+    assert sum(1 for ch in t if unicodedata.category(ch).startswith("L")) < 2
+    sample = "عبود الى ن الخوري BL و طوبيا . . ."
+    t, f = tidy_line(sample, [False] * 5 + [True] * (len(sample) - 5))
+    assert t == "عبود الى الخوري و طوبيا" and len(f) == len(t), (t, len(f))
+    t, f = tidy_line("دَ بَرࣸ", [True] + [False] * (len("دَ بَرࣸ") - 1))
+    assert t == "دَ بَرࣸ", t                                 # a letter with its mark is a word
+    # line clean-up: a box stopping halfway is widened to the ink; a dot box is dropped
+    page = Image.new("L", (800, 200), 255)
+    d = ImageDraw.Draw(page)
+    d.rectangle([40, 60, 760, 90], fill=0)                  # one long line of "ink"
+    d.ellipse([400, 150, 406, 156], fill=0)                 # a dot below it
+    got = refine_boxes(page.convert("RGB"), [(420, 50, 760, 100), (395, 145, 411, 160)])
+    assert len(got) == 1 and got[0][0] <= 45 and got[0][2] >= 755, got
+    print("tidying: dots, Latin and lone letters removed; a short box widened to its line; a dot box dropped")
     print("all lens self-tests passed")
 
 
