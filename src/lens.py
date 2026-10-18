@@ -728,6 +728,10 @@ CSS = """
   align-items: baseline; font-size: .9rem; color: var(--nq-faded); }
 .nq-models .nq-text { font-size: 1.4rem; line-height: 1.9; margin: 0; color: var(--nq-faded); }
 .nq-faint { color: var(--nq-faded); font-style: italic; }
+.nq-boko { font-family: 'Gentium Book Plus', Georgia, serif; font-size: 1.15rem; line-height: 1.6;
+  margin: 2px 0 0; direction: ltr; text-align: left; color: var(--nq-ink); }
+.nq-en { font-size: 1.02rem; line-height: 1.55; margin: 2px 0 0; direction: ltr; text-align: left;
+  font-style: italic; color: var(--nq-faded); }
 .nq-empty { padding: 28px 4px; color: var(--nq-faded); font-size: 1.08rem; line-height: 1.6; max-width: 46ch; }
 
 /* the desk: quiet controls, one inked action */
@@ -756,7 +760,11 @@ def render_html(crops, results, seconds, method, show_models, script="ajami", us
              f'in {seconds:.1f} seconds; lines found by {html.escape(method)}'
              f'{"" if use_lm else ", using the tested system only"}. A letter in blue with '
              f'dots beneath it means the recognisers disagreed about it: check those letters against '
-             f'the manuscript.</p>']
+             f'the manuscript.'
+             + (' The English (and, for Ajami, the Latin script) is experimental and still being improved: '
+                'it is a machine translation of the reading, best read as a gist.'
+                if any(r.get("boko") or r.get("english") for r in results) else '')
+             + '</p>']
     for k, (crop, r) in enumerate(zip(crops, results), 1):
         models = ""
         if show_models:
@@ -764,10 +772,15 @@ def render_html(crops, results, seconds, method, show_models, script="ajami", us
                 f'<span>{html.escape(name)}</span>'
                 f'<p class="nq-text" lang="{lang}">{html.escape(t).replace(" ", "&nbsp;") or "—"}</p>'
                 for name, t in r["models"].items()) + "</div>"
+        extra = ""
+        if r.get("boko"):
+            extra += f'<p class="nq-boko" lang="ha">{html.escape(r["boko"])}</p>'
+        if r.get("english"):
+            extra += f'<p class="nq-en" lang="en">{html.escape(r["english"])}</p>'
         parts.append(f'<div class="nq-line"><div class="nq-num">{k}</div>'
                      f'<img src="{_image_uri(crop)}" alt="Line {k} of the page">'
                      f'<p class="nq-text" lang="{lang}">{highlight(r["text"], r["unsure"])}</p>'
-                     f'{models}</div>')
+                     f'{extra}{models}</div>')
     parts.append("</div>")
     return "".join(parts)
 
@@ -785,12 +798,66 @@ def standalone_page(body):
             f"{body}</body></html>")
 
 
+
+# ---------------------------------------------------------------------------
+# Latin script and English (Ajami, experimental)
+# ---------------------------------------------------------------------------
+_NLLB = {}
+
+
+def translate_lines(lines, src_lang="hau_Latn", device="cpu"):
+    """
+    English with NLLB-200 (600M), loaded on first use. src_lang: hau_Latn for
+    Latin-script Hausa; apc_Arab (North Levantine Arabic) for Muharaf, whose
+    letters are mostly in Lebanese Arabic.
+    """
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    if "model" not in _NLLB:
+        name = "facebook/nllb-200-distilled-600M"
+        _NLLB["tok"] = AutoTokenizer.from_pretrained(name, src_lang=src_lang)
+        _NLLB["model"] = AutoModelForSeq2SeqLM.from_pretrained(name).to(device).eval()
+    tok, model = _NLLB["tok"], _NLLB["model"]
+    tok.src_lang = src_lang
+    out = []
+    for i in range(0, len(lines), 16):
+        batch = tok(lines[i:i + 16], return_tensors="pt", padding=True).to(model.device)
+        with torch.no_grad():
+            gen = model.generate(**batch, forced_bos_token_id=tok.convert_tokens_to_ids("eng_Latn"),
+                                 max_new_tokens=64)
+        out += tok.batch_decode(gen, skip_special_tokens=True)
+    return out
+
+
+def add_latin_and_english(results, device="cpu", log=print, english=True, script="ajami"):
+    """
+    Ajami: Boko (rule-based, ajami2boko.py), then English from it.
+    Arabic: English directly from the reading.
+    """
+    if script == "ajami":
+        from ajami2boko import transliterate
+        for r in results:
+            r["boko"] = transliterate(r["text"])
+        source, src_lang = "boko", "hau_Latn"
+    else:
+        source, src_lang = "text", "apc_Arab"
+    if not english:
+        return results
+    todo = [k for k, r in enumerate(results) if r.get(source)]
+    try:
+        en = translate_lines([results[k][source] for k in todo], src_lang, device)
+        for k, e in zip(todo, en):
+            results[k]["english"] = e
+    except Exception as e:                                # noqa: BLE001
+        log(f"translation unavailable: {e!r}")
+    return results
+
 # ---------------------------------------------------------------------------
 # one page, end to end
 # ---------------------------------------------------------------------------
 
 def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajami", use_lm=True,
-              tidy=True):
+              tidy=True, translate=False):
     img = ImageOps.exif_transpose(img).convert("RGB")
     W, H = img.size
     if mode == "single" or (mode == "auto" and looks_like_single_line(img)):
@@ -814,7 +881,14 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
     seconds = time.time() - t0
     if tidy:
         boxes, crops, results = tidy_results(boxes, crops, results)
+    if translate:
+        add_latin_and_english(results, getattr(reader, "device", "cpu"), log, script=script)
     text = "\n".join(r["text"] for r in results)
+    if any(r.get("boko") for r in results):
+        text += "\n\nLatin script (Boko, experimental):\n" + "\n".join(r.get("boko", "") for r in results)
+    if any(r.get("english") for r in results):
+        text += ("\n\nEnglish (machine translation, experimental):\n"
+                 + "\n".join(r.get("english", "") for r in results))
     return boxes, crops, results, seconds, method, text
 
 
@@ -919,6 +993,8 @@ FOOT = """
   <li>A language model learned from the training transcriptions helps the vote prefer real words.
   It only chooses among letters the recognisers proposed; it never invents text.</li>
   <li>Letters the recognisers disputed are shown in blue, with dots beneath them.</li>
+  <li>Optionally, each line is translated to English by a machine translation model; Ajami lines are
+  first written in Latin script (Boko) by rule. Both are experimental and still being improved.</li>
 </ol>
 <p><strong>How well it reads.</strong> On manuscript lines held out from training it made fewer
 errors than the published systems: a character error rate of 10.42% on Ajami, where the published
@@ -945,7 +1021,7 @@ def build_app(reader, kraken_bin):
     available = getattr(reader, "scripts", {"ajami": None})
     scripts = {PROFILES[k]["label"]: k for k in PROFILES if k in available}
 
-    def run(image, script_label, mode_label, lm_on, tidy_on, show_models):
+    def run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models):
         if image is None:
             return None, EMPTY, ""
         script = scripts.get(script_label, "ajami")
@@ -953,7 +1029,7 @@ def build_app(reader, kraken_bin):
         try:
             boxes, crops, results, secs, method, text = read_page(
                 reader, image, modes[mode_label], kraken_bin, log=notes.append, script=script,
-                use_lm=bool(lm_on), tidy=bool(tidy_on))
+                use_lm=bool(lm_on), tidy=bool(tidy_on), translate=bool(trans_on))
         except Exception as e:                              # noqa: BLE001
             return None, (f'<div class="nq-empty">Reading stopped with an error: '
                           f'{html.escape(repr(e))}. Try "The image is one line" for a single '
@@ -978,6 +1054,9 @@ def build_app(reader, kraken_bin):
                                label="Script")
                 mode = _make(gr.Radio, choices=list(modes), value="Automatic",
                              label="How to find the lines")
+                trans = _make(gr.Checkbox, value=False,
+                              label="Also show an English translation, and for Ajami the Latin script "
+                                    "(experimental, still being improved)")
                 go = _make(gr.Button, "Read the page", variant="primary", elem_id="nq-read-btn")
                 with _make(gr.Accordion, "Advanced options", open=False):
                     lm_on = _make(gr.Checkbox, value=True,
@@ -995,7 +1074,7 @@ def build_app(reader, kraken_bin):
         txt = _make(gr.Textbox, label="The text, to copy", lines=8, rtl=True,
                     show_copy_button=True, buttons=["copy"], elem_id="nq-copy")
         gr.HTML(FOOT, elem_id="nq-foot")
-        go.click(run, inputs=[inp, script, mode, lm_on, tidy, show], outputs=[boxed, out, txt])
+        go.click(run, inputs=[inp, script, mode, trans, lm_on, tidy, show], outputs=[boxed, out, txt])
     return demo
 
 
@@ -1137,6 +1216,13 @@ def _self_test():
     got = refine_boxes(page.convert("RGB"), [(420, 50, 760, 100), (395, 145, 411, 160)])
     assert len(got) == 1 and got[0][0] <= 45 and got[0][2] >= 755, got
     print("tidying: dots, Latin and lone letters removed; a short box widened to its line; a dot box dropped")
+    res = add_latin_and_english([{"text": "وَاڧَرْ إِࢽْڢِرَاجِ تَڢَرْکࣸو", "unsure": [False] * 28, "models": {}}],
+                                english=False)
+    assert res[0]["boko"] == "waƙar infiraji tafarko", res[0]["boko"]
+    res[0]["english"] = "The first song of Infiraji"
+    page_html = render_html([crops[0]], res, 1.0, "a test", False, "ajami")
+    assert 'class="nq-boko"' in page_html and 'class="nq-en"' in page_html and "experimental" in page_html
+    print("Latin script and English: transliterated, shown under the line, marked experimental")
     print("all lens self-tests passed")
 
 
