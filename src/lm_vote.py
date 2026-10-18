@@ -93,23 +93,24 @@ class KNLM:
         return math.log(max(self.prob(h, c), 1e-12))
 
 
-def _column_scores(col, gap_conf=0.5):
+def _column_scores(col, gap_conf=0.5, weights=None):
     sc = {}
-    for ch, c in col:
-        sc[ch] = sc.get(ch, 0.0) + (gap_conf if ch is GAP else (c if c is not None else 0.0))
+    for m, (ch, c) in enumerate(col):
+        w = 1.0 if weights is None else weights[m]
+        sc[ch] = sc.get(ch, 0.0) + w * (gap_conf if ch is GAP else (c if c is not None else 0.0))
     return sc
 
 
-def lm_decode(hyps, lm, lam=0.25, gap_bias=-0.8, beam=8, constrain=True):
+def lm_decode(hyps, lm, lam=0.25, gap_bias=-0.8, beam=8, constrain=True, weights=None, network=None):
     """
     Returns (text, unsure flags). With lam = 0 and gap_bias = 0 this is the
     plain confidence vote. Flags mark a character that only one model proposed
     or that won less than half of its column's score, as in lens.ensemble_line.
     """
-    net = build_network(hyps)
+    net = network if network is not None else build_network(hyps)
     beams = [(0.0, "", tuple([BOS] * (lm.N - 1)), [])]      # score, text, history, flags
     for col in net:
-        scores = _column_scores(col)
+        scores = _column_scores(col, weights=weights)
         total = sum(scores.values()) or 1.0
         cands = candidates(col)
         new = []

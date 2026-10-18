@@ -68,8 +68,14 @@ PROFILES = {
               "lang": "ha-Arab", "lm": {"order": 8, "lam": 0.15, "gap_bias": 0.0}},
     "arabic": {"label": "Arabic", "dir": "arabic", "crnns": ["crnn1", "crnn2", "crnn3"],
                "order": ["crnn1", "crnn3", "crnn2", "trocr"], "max_len": 256, "bidi": True,
-               "lang": "ar", "lm": {"order": 8, "lam": 0.25, "gap_bias": -0.8}},
+               "lang": "ar", "lm": {"order": 8, "lam": 0.35, "gap_bias": -0.8},
+               "tta": {"variants": ["light", "dark", "thick", "thin"], "variant_weight": 1.0,
+                       "trocr_weight": 1.75}},
 }
+# "tta" (Arabic): each CRNN also reads every line four more ways (ink lighter,
+# darker, thicker, thinner), giving the vote 16 readings; members are ordered
+# as in the tuning: crnn1, crnn3, crnn2, trocr, then each CRNN's variants in
+# that CRNN order. With the language model: half B 10.83% -> 9.16% CER.
 # "lm": the character language model in the vote (lm_vote.py), built at start-up
 # from <models>/lm_ajami.txt or <models>/lm_arabic.txt: the training
 # transcriptions, one line each. Settings were tuned on validation
@@ -418,6 +424,27 @@ def looks_like_single_line(img):
 # the ensemble, with per-character certainty
 # ---------------------------------------------------------------------------
 
+
+def _variant_thick(a):
+    from scipy.ndimage import grey_erosion
+    return grey_erosion(a, size=(2, 2))
+
+
+def _variant_thin(a):
+    from scipy.ndimage import grey_dilation
+    return grey_dilation(a, size=(2, 2))
+
+
+# Test-time variants of a 64-pixel greyscale line (applied before mirroring),
+# exactly as used to tune the enhanced Arabic reading.
+VARIANTS = {
+    "thick": _variant_thick,
+    "thin": _variant_thin,
+    "dark": lambda a: (255.0 * (a / 255.0) ** 1.6).astype(np.uint8),
+    "light": lambda a: (255.0 * (a / 255.0) ** 0.6).astype(np.uint8),
+}
+
+
 def ensemble_line(hyps, gap_conf=0.5):
     """
     The final system's rule (alignment.vote, confidence mode, then
@@ -501,7 +528,7 @@ class _Script:
         else:
             print(f"{key}: no lm_{key}.txt, the language model option is off")
 
-    def _read_crnn(self, model, alphabet, images):
+    def _read_crnn(self, model, alphabet, images, variant=None):
         from predict import ctc_decode_with_confidence
         from bidi_order import mirror_order_with_confidence
         torch = self.torch
@@ -510,6 +537,8 @@ class _Script:
             g = im.convert("L")
             w = max(1, min(MAX_WIDTH, int(round(g.width * HEIGHT / g.height))))
             a = np.array(g.resize((w, HEIGHT), Image.LANCZOS), dtype=np.uint8)
+            if variant is not None:
+                a = VARIANTS[variant](a)
             arrays.append(np.ascontiguousarray(a[:, ::-1]))   # mirrored, as trained
             widths.append(w)
         batch = torch.ones(len(images), 1, HEIGHT, max(widths))   # white padding
@@ -542,11 +571,20 @@ class _Script:
         per_model = {name: self._read_crnn(model, alphabet, images)
                      for name, model, alphabet in self.crnns}
         per_model["trocr"] = self._read_trocr(images)
+        order, weights = list(self.profile["order"]), None
         lm = self.lm if use_lm else None
-        return combine(per_model, self.profile["order"], len(images), lm, self.profile["lm"])
+        tta = self.profile.get("tta") if use_lm else None
+        if tta:
+            for name, model, alphabet in sorted(self.crnns, key=lambda c: order.index(c[0])):
+                for v in tta["variants"]:
+                    per_model[f"{name}_{v}"] = self._read_crnn(model, alphabet, images, variant=v)
+                    order.append(f"{name}_{v}")
+            weights = [tta["trocr_weight"] if m == "trocr" else 1.0 if "_" not in m
+                       else tta["variant_weight"] for m in order]
+        return combine(per_model, order, len(images), lm, self.profile["lm"], weights)
 
 
-def combine(per_model, order, n, lm=None, lm_settings=None):
+def combine(per_model, order, n, lm=None, lm_settings=None, weights=None):
     """
     The vote over each line's readings, members in evaluation order. With a
     language model, the vote is searched with it (lm_vote.lm_decode);
@@ -561,11 +599,12 @@ def combine(per_model, order, n, lm=None, lm_settings=None):
             hyps.append(Hypothesis(name, text, conf))
         if lm is not None:
             from lm_vote import lm_decode
-            text, flags = lm_decode(hyps, lm, lam=lm_settings["lam"], gap_bias=lm_settings["gap_bias"])
+            text, flags = lm_decode(hyps, lm, lam=lm_settings["lam"], gap_bias=lm_settings["gap_bias"],
+                                    weights=weights)
         else:
             text, flags = ensemble_line(hyps)
-        results.append({"text": text, "unsure": flags,
-                        "models": {h.model: h.text for h in hyps}})
+        results.append({"text": text, "unsure": flags,           # shown: the four main readers
+                        "models": {h.model: h.text for h in hyps if "_" not in h.model}})
     return results
 
 
@@ -875,6 +914,8 @@ FOOT = """
   <li>It finds the lines of text on the page.</li>
   <li>Several recognisers of different kinds read every line: three for Ajami, four for Arabic.</li>
   <li>A vote combines their readings letter by letter, trusting each by its confidence.</li>
+  <li>For Arabic, each recogniser also reads every line a few more ways (ink lighter, darker, thicker,
+  thinner), so the vote has more readings to choose from.</li>
   <li>A language model learned from the training transcriptions helps the vote prefer real words.
   It only chooses among letters the recognisers proposed; it never invents text.</li>
   <li>Letters the recognisers disputed are shown in blue, with dots beneath them.</li>
@@ -882,8 +923,8 @@ FOOT = """
 <p><strong>How well it reads.</strong> On manuscript lines held out from training it made fewer
 errors than the published systems: a character error rate of 10.42% on Ajami, where the published
 benchmark is 10.66%, and 10.12% on historical Arabic, where the dataset authors' system reached
-12.36% on the same lines. With the language model, validation error fell further, from 10.83% to
-9.35% on Arabic and from 9.80% to 9.57% on Ajami.</p>
+12.36% on the same lines. With the enhanced reading, validation error fell further, from 10.83% to
+9.16% on Arabic and from 9.80% to 9.57% on Ajami.</p>
 <p>A research prototype from a final-year project in the Department of Computer Science, University
 of Ibadan, by Bashir Sekinat Omotoke, supervised by Dr O. A. Abiola. It reads clean scans similar to
 its training manuscripts best; check important readings against the original.</p>
@@ -940,8 +981,8 @@ def build_app(reader, kraken_bin):
                 go = _make(gr.Button, "Read the page", variant="primary", elem_id="nq-read-btn")
                 with _make(gr.Accordion, "Advanced options", open=False):
                     lm_on = _make(gr.Checkbox, value=True,
-                                  label="Prefer readings that form real words (recommended). "
-                                        "Untick to use the system exactly as it was tested.")
+                                  label="Enhanced reading (recommended): read each line several ways and "
+                                        "prefer real words. Untick to use the system exactly as it was tested.")
                     tidy = _make(gr.Checkbox, value=True,
                                  label="Tidy the output: skip dots and specks, widen lines to their full "
                                        "length, hide stray Latin letters and lone letters")
@@ -1067,6 +1108,18 @@ def _self_test():
     assert with_lm["text"] == "سلام كتير" and len(with_lm["unsure"]) == len(with_lm["text"])
     assert lm_decode([Hypothesis(n, t, c) for n, (t, c) in [(k, v[0]) for k, v in per.items()]], lm, lam=0.0, gap_bias=0.0, beam=1)[0] == plain["text"]
     print("language-model vote: picks the word the training lines support; lam 0 equals the evaluated vote")
+    per16 = dict(per)
+    order16 = list(PROFILES["arabic"]["order"])
+    for name in ("crnn1", "crnn3", "crnn2"):
+        for v in PROFILES["arabic"]["tta"]["variants"]:
+            per16[f"{name}_{v}"] = per[name]
+            order16.append(f"{name}_{v}")
+    w16 = [1.75 if m == "trocr" else 1.0 for m in order16]
+    r16 = combine(per16, order16, 1, lm, PROFILES["arabic"]["lm"], w16)[0]
+    assert r16["text"] == "سلام كتير" and set(r16["models"]) == {"crnn1", "crnn3", "crnn2", "trocr"}
+    a = np.full((64, 120), 255, np.uint8); a[20:40, 10:110] = 0
+    assert all(VARIANTS[v](a).shape == a.shape for v in VARIANTS)
+    print("enhanced reading: 16 weighted readings combine; only the four main readers are shown")
 
     # tidying: dots, Latin letters and lone letters go; real words and flags stay aligned
     t, f = tidy_line("1 M . .. ..11", [False] * 13)
