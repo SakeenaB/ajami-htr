@@ -246,12 +246,18 @@ def segment_kraken(img, kraken_bin, log=print):
     """Kraken's pretrained baseline segmenter, run as a separate program."""
     if not kraken_bin or not Path(kraken_bin).exists():
         return None
+    try:
+        import torch
+        device = ["-d", "cuda:0"] if torch.cuda.is_available() else []
+    except Exception:                                       # noqa: BLE001
+        device = []
     with tempfile.TemporaryDirectory() as d:
         page = Path(d) / "page.png"
         img.convert("RGB").save(page)
+        t0 = time.time()
         for flag, ext in (("-n", "json"), ("-a", "xml"), ("-x", "xml")):
             out = Path(d) / f"seg.{ext}"
-            cmd = [str(kraken_bin), "-i", str(page), str(out), flag, "segment", "-bl"]
+            cmd = [str(kraken_bin)] + device + ["-i", str(page), str(out), flag, "segment", "-bl"]
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
             except Exception as e:                          # noqa: BLE001
@@ -264,6 +270,7 @@ def segment_kraken(img, kraken_bin, log=print):
                     log(f"could not read kraken output ({flag}): {e!r}")
                     continue
                 if boxes:
+                    log(f"timings: line finding {time.time() - t0:.1f}s ({'GPU' if device else 'CPU'})")
                     return boxes
             else:
                 log(f"kraken {flag}: exit {r.returncode}: {(r.stderr or r.stdout)[-300:]}")
@@ -556,7 +563,7 @@ class _Script:
             out.append((text, conf))
         return out
 
-    def _read_trocr(self, images, chunk=8):
+    def _read_trocr(self, images, chunk=16):
         from train_trocr import predict
         out = []
         for s in range(0, len(images), chunk):
@@ -747,25 +754,28 @@ CSS = """
   margin: 2px 0 0; direction: ltr; text-align: left; unicode-bidi: isolate; white-space: normal;
   font-style: italic; color: var(--nq-faded); }
 
-/* the reading in progress: three orbits around a dot, the app's own mark */
-.nq-loading { display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 56px 0 48px;
+/* the reading in progress: the dots that tell ب, ت and ث apart, in turn */
+.nq-loading { display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 56px 0 48px;
   color: var(--nq-faded); font-size: 1.05rem; }
-.nq-orbit { position: relative; width: 88px; height: 88px; }
-.nq-orbit span { position: absolute; border-radius: 50%; border: 2px solid transparent;
-  animation: nq-spin 1.6s cubic-bezier(.55,.15,.45,.85) infinite; }
-.nq-orbit span:nth-child(1) { inset: 0; border-top-color: var(--nq-gold); border-left-color: var(--nq-gold); }
-.nq-orbit span:nth-child(2) { inset: 12px 8px 14px 10px; border-right-color: var(--nq-gold); opacity: .7;
-  animation-duration: 2.3s; animation-direction: reverse; }
-.nq-orbit span:nth-child(3) { inset: 26px 24px 22px 28px; border-bottom-color: var(--nq-gold); opacity: .5;
-  animation-duration: 1.2s; }
-.nq-orbit i { position: absolute; left: 50%; top: 50%; width: 10px; height: 10px; margin: -5px 0 0 -5px;
-  border-radius: 50%; background: var(--nq-gold); animation: nq-pulse 1.6s ease-in-out infinite; }
+.nq-letter { width: 112px; height: 75px; overflow: visible; }
+.nq-letter path { fill: none; stroke: var(--nq-ink); stroke-width: 4; stroke-linecap: round; opacity: .85; }
+.nq-letter circle { fill: var(--nq-gold); opacity: 0; transform-box: fill-box; transform-origin: center; }
+.nq-letter .b1 { animation: nq-b 2.4s infinite; }
+.nq-letter .t1, .nq-letter .t2 { animation: nq-t 2.4s infinite; }
+.nq-letter .th1, .nq-letter .th2, .nq-letter .th3 { animation: nq-th 2.4s infinite; }
+.nq-letter .t2, .nq-letter .th2 { animation-delay: .06s; }
+.nq-letter .th3 { animation-delay: .12s; }
+@keyframes nq-b  { 0%, 5% { opacity: 0; transform: translateY(-3px) } 10%, 30% { opacity: 1; transform: none }
+                   36%, 100% { opacity: 0 } }
+@keyframes nq-t  { 0%, 36% { opacity: 0; transform: translateY(-3px) } 42%, 62% { opacity: 1; transform: none }
+                   68%, 100% { opacity: 0 } }
+@keyframes nq-th { 0%, 68% { opacity: 0; transform: translateY(-3px) } 74%, 94% { opacity: 1; transform: none }
+                   100% { opacity: 0 } }
 .nq-stage { margin: 0; letter-spacing: .01em; animation: nq-fade .5s ease-out; }
 @keyframes nq-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-@keyframes nq-spin { to { transform: rotate(360deg); } }
-@keyframes nq-pulse { 0%, 100% { transform: scale(.8); opacity: .7; } 50% { transform: scale(1.15); opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
-  .nq-orbit span { animation-duration: 8s; } .nq-orbit i { animation: none; } }
+  .nq-letter circle { animation: none !important; } .nq-letter .b1 { opacity: 1; }
+  .nq-stage { animation: none; } }
 
 /* calmer surfaces */
 .gradio-container .block { border-radius: 12px !important; box-shadow: 0 1px 3px rgba(16, 32, 63, .06); }
@@ -829,8 +839,14 @@ def render_html(crops, results, seconds, method, show_models, script="ajami", us
 
 
 def loading(stage="Reading the page…"):
-    return ('<div class="nq-loading" role="status" aria-live="polite"><div class="nq-orbit">'
-            '<span></span><span></span><span></span><i></i></div>'
+    """The reading in progress: a letter's bowl whose dots become ب, then ت, then ث."""
+    return ('<div class="nq-loading" role="status" aria-live="polite">'
+            '<svg class="nq-letter" viewBox="0 0 96 64" aria-hidden="true">'
+            '<path d="M10 26 Q 12 44 48 44 Q 84 44 86 26"/>'
+            '<circle class="b1" cx="48" cy="56" r="4.5"/>'
+            '<circle class="t1" cx="41" cy="16" r="4.5"/><circle class="t2" cx="55" cy="16" r="4.5"/>'
+            '<circle class="th1" cx="48" cy="8" r="4.5"/><circle class="th2" cx="41" cy="20" r="4.5"/>'
+            '<circle class="th3" cx="55" cy="20" r="4.5"/></svg>'
             f'<p class="nq-stage">{html.escape(stage)}</p></div>')
 
 
@@ -861,7 +877,13 @@ def standalone_page(body):
 # Latin script and English (Ajami, experimental)
 # ---------------------------------------------------------------------------
 _NLLB = {}
-CANCEL = __import__('threading').Event()     # set by the Stop button
+_CANCELS = {}                       # one Stop switch per browser session
+
+
+def cancel_flag(request=None):
+    import threading
+    key = getattr(request, "session_hash", None) or "default"
+    return _CANCELS.setdefault(key, threading.Event())
 
 
 def translate_lines(lines, src_lang="hau_Latn", device="cpu"):
@@ -1181,7 +1203,8 @@ def build_app(reader, kraken_bin):
     available = getattr(reader, "scripts", {"ajami": None})
     scripts = {PROFILES[k]["label"]: k for k in PROFILES if k in available}
 
-    def run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models):
+    def run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models,
+            request: gr.Request = None):
         """Streams the loader with the current stage, then the page."""
         import queue
         import threading
@@ -1189,10 +1212,11 @@ def build_app(reader, kraken_bin):
             yield None, EMPTY, "", None, ""
             return
         stages, box = queue.Queue(), {}
-        CANCEL.clear()
+        cancel = cancel_flag(request)
+        cancel.clear()
 
         def report(stage):
-            if CANCEL.is_set():
+            if cancel.is_set():
                 raise Stopped()
             stages.put(stage)
 
@@ -1240,8 +1264,8 @@ def build_app(reader, kraken_bin):
         return (f"Learned from {n} corrected line{'s' if n != 1 else ''}. From now on, readings in this "
                 f"session prefer these words and spellings. Corrections are kept until the app restarts.")
 
-    def stop_now():
-        CANCEL.set()
+    def stop_now(request: gr.Request = None):
+        cancel_flag(request).set()                           # stops this browser's reading only
         return None, STOPPED, "", ""
 
     def _run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models, progress=None):
@@ -1306,15 +1330,20 @@ def build_app(reader, kraken_bin):
         gr.HTML(FOOT, elem_id="nq-foot")
         inputs = [inp, script, mode, trans, lm_on, tidy, show]
         outputs = [boxed, out, txt, last, status]
-        try:
-            reading = go.click(run, inputs=inputs, outputs=outputs, show_progress="hidden")
-        except TypeError:                                    # an older Gradio without show_progress
+        try:                                                 # up to three readers at once (phone + laptop)
+            reading = go.click(run, inputs=inputs, outputs=outputs, show_progress="hidden",
+                               concurrency_limit=3)
+        except TypeError:                                    # an older Gradio
             reading = go.click(run, inputs=inputs, outputs=outputs)
         try:                                                 # Stop: cancel the reading and free the queue
             stop.click(stop_now, outputs=[boxed, out, txt, status], cancels=[reading], queue=False)
         except TypeError:
             stop.click(stop_now, outputs=[boxed, out, txt, status])
         teach.click(learn, inputs=[txt, last], outputs=[status])
+    try:
+        demo.queue(default_concurrency_limit=3)
+    except TypeError:
+        demo.queue()
     return demo
 
 
@@ -1398,6 +1427,13 @@ def _self_test():
     assert seen[0] == "Preparing the image…" and seen[1] == "Finding the lines…" and \
         seen[2].startswith("Reading ") and seen[-1] == "Laying out the page…", seen
     assert "Preparing the image…" in loading("Preparing the image…")
+
+    class _Req:
+        def __init__(self, h): self.session_hash = h
+    a, b = cancel_flag(_Req("laptop")), cancel_flag(_Req("phone"))
+    a.set()
+    assert a.is_set() and not b.is_set(), "Stop on one device must not stop another"
+    a.clear()
 
     def stop_at_reading(msg):
         if msg.startswith("Reading "):
