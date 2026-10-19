@@ -309,6 +309,33 @@ def group_rows(boxes, overlap=0.5):
 
 
 
+
+def split_white_bands(img, min_strips=3):
+    """
+    A sheet of line images stacked with pure-white gaps (as made for the demos):
+    each strip is one line. Returns the strips' boxes, trimmed to their content,
+    or None for an ordinary page (real paper is never pure white edge to edge).
+    """
+    g = np.asarray(img.convert("L"), dtype=np.uint8)
+    white_row = (g >= 250).all(axis=1)
+    boxes, y = [], 0
+    H = len(white_row)
+    while y < H:
+        if white_row[y]:
+            y += 1
+            continue
+        y0 = y
+        while y < H and not white_row[y]:
+            y += 1
+        band = g[y0:y]
+        cols = np.where((band < 250).any(axis=0))[0]
+        if len(cols) and (y - y0) >= 8:
+            boxes.append((int(cols[0]), y0, int(cols[-1]) + 1, y))
+    gaps = white_row.sum()
+    if len(boxes) >= min_strips and gaps >= 4 * (len(boxes) - 1):
+        return boxes
+    return None
+
 def refine_boxes(img, boxes):
     """
     Clean the segmenter's lines before reading them (display and reading only;
@@ -1109,15 +1136,20 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
     else:
         say("Finding the lines…")
         boxes, method = None, None
-        if mode in ("auto", "kraken"):
+        if mode == "auto":
+            strips = split_white_bands(img)
+            if strips:
+                boxes, method = strips, "the white gaps between line strips"
+        if not boxes and mode in ("auto", "kraken"):
             found = segment_kraken(img, kraken_bin, log=log)
             if found:
                 boxes, method = found, "Kraken's page segmenter"
         if not boxes:
             boxes, method = segment_projection(img), "the projection segmenter"
-        boxes = group_rows(boxes)
-        if tidy:
-            boxes = refine_boxes(img, boxes)
+        if method != "the white gaps between line strips":
+            boxes = group_rows(boxes)
+            if tidy:
+                boxes = refine_boxes(img, boxes)
     boxes = [(max(0, x0), max(0, y0), min(W, x1), min(H, y1)) for x0, y0, x1, y1 in boxes
              if x1 - x0 > 10 and y1 - y0 > 8][:MAX_LINES]
     crops = [img.crop(b) for b in boxes]
@@ -1617,7 +1649,14 @@ def _self_test():
     lines3 = [(40, 40, 760, 90), (40, 110, 760, 160), (40, 180, 760, 230)]
     got = refine_boxes(page2.convert("RGB"), lines3 + [(395, 230, 411, 244), (695, 325, 735, 355)])
     assert len(got) == 4 and got[-1][1] >= 320, got                           # dot gone, page number kept
-    print("tidying: dots, Latin and lone letters removed; a short box widened to its line; a dot box dropped; a page number kept")
+    sheet = Image.new("RGB", (600, 300), (255, 255, 255))
+    for k, y in enumerate((10, 90, 170, 250)):
+        sheet.paste(Image.new("RGB", (500 - 60 * k, 40), (225, 214, 190)), (80 + 60 * k, y))
+    got = split_white_bands(sheet)
+    assert got is not None and len(got) == 4 and got[3][0] == 260, got
+    assert split_white_bands(Image.new("RGB", (600, 300), (232, 220, 191))) is None   # a real page: no
+    print("tidying: dots, Latin and lone letters removed; a short box widened to its line; a dot box dropped; "
+          "a page number kept; a sheet of strips cut at its white gaps")
     res = add_latin_and_english([{"text": "وَاڧَرْ إِࢽْڢِرَاجِ تَڢَرْکࣸو", "unsure": [False] * 28, "models": {}}],
                                 english=False)
     assert res[0]["boko"] == "waƙar infiraji ta farko", res[0]["boko"]
