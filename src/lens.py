@@ -36,6 +36,7 @@ CRNN folder holds best.pt and alphabet.json; each TrOCR folder a saved model.
 from __future__ import annotations
 
 import argparse
+import os
 import base64
 import re
 import difflib
@@ -567,6 +568,13 @@ class _Script:
                 out.append((r["prediction"], json.loads(r["confidence"])))
         return out
 
+    def learn(self, lines):
+        """Add corrected lines to this script's language model, for the rest of the session."""
+        if self.lm is None or not lines:
+            return 0
+        self.lm.add_texts(lines)
+        return len(lines)
+
     def read(self, images, use_lm=True):
         per_model = {name: self._read_crnn(model, alphabet, images)
                      for name, model, alphabet in self.crnns}
@@ -627,6 +635,9 @@ class Reader:
         if not images:
             return []
         return self.scripts[script].read(images, use_lm)
+
+    def learn(self, lines, script="ajami"):
+        return self.scripts[script].learn(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +739,12 @@ CSS = """
   align-items: baseline; font-size: .9rem; color: var(--nq-faded); }
 .nq-models .nq-text { font-size: 1.4rem; line-height: 1.9; margin: 0; color: var(--nq-faded); }
 .nq-faint { color: var(--nq-faded); font-style: italic; }
+.nq-ai { font-family: 'Scheherazade New', 'Amiri', 'Noto Naskh Arabic', serif; font-size: 1.5rem;
+  line-height: 1.9; direction: rtl; text-align: right; margin: 2px 0 0; color: var(--nq-ink);
+  border-right: 3px solid var(--nq-gold); padding-right: 10px; }
+.nq-ai-tag { font-family: 'Noto Sans', sans-serif; font-size: .7rem; letter-spacing: .04em;
+  color: var(--nq-gold); border: 1px solid var(--nq-gold); border-radius: 3px; padding: 0 4px;
+  margin-left: 8px; vertical-align: middle; }
 .nq-boko { font-family: 'Gentium Book Plus', Georgia, serif; font-size: 1.15rem; line-height: 1.6;
   margin: 2px 0 0; direction: ltr; text-align: left; color: var(--nq-ink); }
 .nq-en { font-size: 1.02rem; line-height: 1.55; margin: 2px 0 0; direction: ltr; text-align: left;
@@ -761,6 +778,8 @@ def render_html(crops, results, seconds, method, show_models, script="ajami", us
              f'{"" if use_lm else ", using the tested system only"}. A letter in blue with '
              f'dots beneath it means the recognisers disagreed about it: check those letters against '
              f'the manuscript.'
+             + (' Lines marked AI are a faithful correction by Claude, shown beside the reading for '
+                'comparison, never replacing it.' if any(r.get("ai") for r in results) else '')
              + (' The English (and, for Ajami, the Latin script) is experimental and still being improved: '
                 'it is a machine translation of the reading, best read as a gist.'
                 if any(r.get("boko") or r.get("english") for r in results) else '')
@@ -773,6 +792,9 @@ def render_html(crops, results, seconds, method, show_models, script="ajami", us
                 f'<p class="nq-text" lang="{lang}">{html.escape(t).replace(" ", "&nbsp;") or "—"}</p>'
                 for name, t in r["models"].items()) + "</div>"
         extra = ""
+        if r.get("ai"):
+            extra += (f'<p class="nq-ai" lang="{lang}"><span class="nq-ai-tag">AI</span>'
+                      f'{html.escape(r["ai"])}</p>')
         if r.get("boko"):
             extra += f'<p class="nq-boko" lang="ha">{html.escape(r["boko"])}</p>'
         if r.get("english"):
@@ -835,9 +857,9 @@ def add_latin_and_english(results, device="cpu", log=print, english=True, script
     Arabic: English directly from the reading.
     """
     if script == "ajami":
-        from ajami2boko import transliterate
+        from ajami2boko import to_boko
         for r in results:
-            r["boko"] = transliterate(r["text"])
+            r["boko"] = to_boko(r["text"])
         source, src_lang = "boko", "hau_Latn"
     else:
         source, src_lang = "text", "apc_Arab"
@@ -852,12 +874,71 @@ def add_latin_and_english(results, device="cpu", log=print, english=True, script
         log(f"translation unavailable: {e!r}")
     return results
 
+
+# ---------------------------------------------------------------------------
+# AI-corrected reading (Arabic, experimental): Claude, faithful + evidence
+# ---------------------------------------------------------------------------
+# Exactly the instructions measured on validation half B (544 lines): with
+# Claude Opus 5.5, CER 9.16% -> 7.65% on top of the enhanced reading (202
+# lines better, 15 worse); a free "readable" rewrite was far worse, so it is
+# not offered. Needs ANTHROPIC_API_KEY in the environment; shown beside the
+# reading, never replacing it.
+AI_MODEL = "claude-opus-5-5"
+AI_SYSTEM = (
+    "You are helping digitise handwritten Arabic letters and documents from Lebanon, written between the "
+    "early 19th and early 21st centuries, mostly in Ruq'ah script and often in Lebanese colloquial Arabic. "
+    "You receive a machine's reading of each line of one page. Correct only clear recognition errors: wrong "
+    "letters (especially dots), wrongly split or joined words, misread names when the evidence supports it. "
+    "Preserve the writer's own spelling and dialect (for example كتير، شو، الي، انشالله): do not convert to "
+    "Modern Standard Arabic, and do not add hamzas, vowel marks or punctuation that the reading lacks. If "
+    "unsure, keep the machine's reading. For each line you also get the readings of four separate "
+    "recognisers; prefer letters and words that the evidence supports. Return exactly {n} lines, numbered "
+    "'1.' to '{n}.', each containing only the Arabic text, nothing else.")
+
+
+def ai_available():
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
+def ai_prompt(results):
+    names = ["crnn1", "crnn3", "crnn2", "trocr"]
+    body = []
+    for i, r in enumerate(results, 1):
+        m = r.get("models", {})
+        body.append(f"{i}. reading: {r['text']}\n" + "\n".join(
+            f"   recogniser {chr(65 + k)}: {m.get(n, '')}" for k, n in enumerate(names)))
+    return AI_SYSTEM.format(n=len(results)), "\n".join(body)
+
+
+def parse_numbered(text, fallback):
+    got = {int(m.group(1)): m.group(2).strip()
+           for m in re.finditer(r"^\s*(\d+)\s*[.)]\s*(.*)$", text, flags=re.M)}
+    return [got.get(i, f) or f for i, f in enumerate(fallback, 1)]
+
+
+def add_ai_correction(results, log=print):
+    """Ask Claude for a faithful correction of the page; sets r['ai'] on each line."""
+    if not results:
+        return results
+    try:
+        import anthropic
+        system, body = ai_prompt(results)
+        msg = anthropic.Anthropic().messages.create(
+            model=AI_MODEL, max_tokens=4000, system=system,
+            messages=[{"role": "user", "content": body}])
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+        for r, line in zip(results, parse_numbered(text, [r["text"] for r in results])):
+            r["ai"] = line
+    except Exception as e:                                # noqa: BLE001
+        log(f"AI correction unavailable: {e!r}")
+    return results
+
 # ---------------------------------------------------------------------------
 # one page, end to end
 # ---------------------------------------------------------------------------
 
 def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajami", use_lm=True,
-              tidy=True, translate=False):
+              tidy=True, translate=False, ai=False):
     img = ImageOps.exif_transpose(img).convert("RGB")
     W, H = img.size
     if mode == "single" or (mode == "auto" and looks_like_single_line(img)):
@@ -881,9 +962,14 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
     seconds = time.time() - t0
     if tidy:
         boxes, crops, results = tidy_results(boxes, crops, results)
+    if ai and script == "arabic" and ai_available():
+        add_ai_correction(results, log)
     if translate:
         add_latin_and_english(results, getattr(reader, "device", "cpu"), log, script=script)
     text = "\n".join(r["text"] for r in results)
+    if any(r.get("ai") for r in results):
+        text += ("\n\nAI-corrected reading (experimental, Claude):\n"
+                 + "\n".join(r.get("ai", "") for r in results))
     if any(r.get("boko") for r in results):
         text += "\n\nLatin script (Boko, experimental):\n" + "\n".join(r.get("boko", "") for r in results)
     if any(r.get("english") for r in results):
@@ -993,6 +1079,11 @@ FOOT = """
   <li>A language model learned from the training transcriptions helps the vote prefer real words.
   It only chooses among letters the recognisers proposed; it never invents text.</li>
   <li>Letters the recognisers disputed are shown in blue, with dots beneath them.</li>
+  <li>You can correct the text and press <em>Teach Iʿjām my corrections</em>: the language model learns
+  your corrected words at once, so later readings prefer them.</li>
+  <li>When an API key is provided, Arabic pages can also get an AI-corrected reading from Claude, which
+  fixes clear recognition errors while keeping the writer's spelling and dialect. It is shown beside the
+  reading, never instead of it.</li>
   <li>Optionally, each line is translated to English by a machine translation model; Ajami lines are
   first written in Latin script (Boko) by rule. Both are experimental and still being improved.</li>
 </ol>
@@ -1021,7 +1112,35 @@ def build_app(reader, kraken_bin):
     available = getattr(reader, "scripts", {"ajami": None})
     scripts = {PROFILES[k]["label"]: k for k in PROFILES if k in available}
 
-    def run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models):
+    def run(image, script_label, mode_label, ai_on, trans_on, lm_on, tidy_on, show_models):
+        out = _run(image, script_label, mode_label, ai_on, trans_on, lm_on, tidy_on, show_models)
+        reading = out[2].split("\n\nAI-corrected")[0].split("\n\nLatin script")[0].split("\n\nEnglish")[0]
+        return out + ({"script": scripts.get(script_label, "ajami"), "lines": reading.split("\n")},
+                      "")
+
+    def correction_lines(edited, state):
+        """Corrected lines: the edited reading's lines that differ from the machine's."""
+        if not state or not edited:
+            return []
+        edited = edited.split("\n\nAI-corrected")[0].split("\n\nLatin script")[0].split("\n\nEnglish")[0]
+        original = set(l.strip() for l in state["lines"])
+        return [l.strip() for l in edited.split("\n") if l.strip() and l.strip() not in original]
+
+    def learn(edited, state):
+        lines = correction_lines(edited, state)
+        if not lines:
+            return ("No corrections found: edit the text above (fix the misread letters or words), "
+                    "then press the button.")
+        try:
+            n = reader.learn(lines, state["script"])
+        except Exception as e:                              # noqa: BLE001
+            return f"Could not learn from the corrections: {e!r}"
+        if not n:
+            return "Learning needs the language model, which is not loaded for this script."
+        return (f"Learned from {n} corrected line{'s' if n != 1 else ''}. From now on, readings in this "
+                f"session prefer these words and spellings. Corrections are kept until the app restarts.")
+
+    def _run(image, script_label, mode_label, ai_on, trans_on, lm_on, tidy_on, show_models):
         if image is None:
             return None, EMPTY, ""
         script = scripts.get(script_label, "ajami")
@@ -1029,7 +1148,7 @@ def build_app(reader, kraken_bin):
         try:
             boxes, crops, results, secs, method, text = read_page(
                 reader, image, modes[mode_label], kraken_bin, log=notes.append, script=script,
-                use_lm=bool(lm_on), tidy=bool(tidy_on), translate=bool(trans_on))
+                use_lm=bool(lm_on), tidy=bool(tidy_on), translate=bool(trans_on), ai=bool(ai_on))
         except Exception as e:                              # noqa: BLE001
             return None, (f'<div class="nq-empty">Reading stopped with an error: '
                           f'{html.escape(repr(e))}. Try "The image is one line" for a single '
@@ -1054,6 +1173,8 @@ def build_app(reader, kraken_bin):
                                label="Script")
                 mode = _make(gr.Radio, choices=list(modes), value="Automatic",
                              label="How to find the lines")
+                ai_box = _make(gr.Checkbox, value=False, visible=ai_available(),
+                               label="Also show an AI-corrected reading (Arabic; experimental; uses Claude)")
                 trans = _make(gr.Checkbox, value=False,
                               label="Also show an English translation, and for Ajami the Latin script "
                                     "(experimental, still being improved)")
@@ -1071,10 +1192,16 @@ def build_app(reader, kraken_bin):
                 boxed = _make(gr.Image, type="pil", label="Lines found", interactive=False)
             with gr.Column(scale=4):
                 out = gr.HTML(EMPTY)
-        txt = _make(gr.Textbox, label="The text, to copy", lines=8, rtl=True,
-                    show_copy_button=True, buttons=["copy"], elem_id="nq-copy")
+        txt = _make(gr.Textbox, label="The text: copy it, or correct it and teach Iʿjām", lines=8,
+                    rtl=True, interactive=True, show_copy_button=True, buttons=["copy"], elem_id="nq-copy")
+        with gr.Row():
+            teach = _make(gr.Button, "Teach Iʿjām my corrections", variant="secondary", elem_id="nq-teach")
+        status = gr.Markdown("")
+        last = gr.State(None)
         gr.HTML(FOOT, elem_id="nq-foot")
-        go.click(run, inputs=[inp, script, mode, trans, lm_on, tidy, show], outputs=[boxed, out, txt])
+        go.click(run, inputs=[inp, script, mode, ai_box, trans, lm_on, tidy, show],
+                 outputs=[boxed, out, txt, last, status])
+        teach.click(learn, inputs=[txt, last], outputs=[status])
     return demo
 
 
@@ -1218,11 +1345,26 @@ def _self_test():
     print("tidying: dots, Latin and lone letters removed; a short box widened to its line; a dot box dropped")
     res = add_latin_and_english([{"text": "وَاڧَرْ إِࢽْڢِرَاجِ تَڢَرْکࣸو", "unsure": [False] * 28, "models": {}}],
                                 english=False)
-    assert res[0]["boko"] == "waƙar infiraji tafarko", res[0]["boko"]
+    assert res[0]["boko"] == "waƙar infiraji ta farko", res[0]["boko"]
     res[0]["english"] = "The first song of Infiraji"
     page_html = render_html([crops[0]], res, 1.0, "a test", False, "ajami")
     assert 'class="nq-boko"' in page_html and 'class="nq-en"' in page_html and "experimental" in page_html
     print("Latin script and English: transliterated, shown under the line, marked experimental")
+    s_ar = _Script.__new__(_Script)
+    s_ar.lm = KNLM.from_texts(["الى بيت الشيخ موسى"] * 30, order=5)
+    assert s_ar.learn(["بيت الشيخ يزبك"]) == 1 and s_ar.lm.prob(tuple("الشيخ ي")[-4:], "ز") > 0
+    print("learning from corrections: a corrected line is added to the script's language model")
+    demo = [{"text": "الحديب لان للابنة", "unsure": [False] * 17,
+             "models": {"crnn1": "الحديت لان", "crnn3": "الحديب", "crnn2": "الحديب", "trocr": "الحديث لان"}},
+            {"text": "واكثروا من", "unsure": [False] * 10, "models": {}}]
+    system, body = ai_prompt(demo)
+    assert "exactly 2 lines" in system and "recogniser D: الحديث لان" in body
+    got = parse_numbered("1. الحديث لان للابنة\n2) واكثروا من", [d["text"] for d in demo])
+    assert got == ["الحديث لان للابنة", "واكثروا من"]
+    assert parse_numbered("nothing useful", ["a", "b"]) == ["a", "b"]       # falls back to the reading
+    demo[0]["ai"] = got[0]
+    assert 'class="nq-ai"' in render_html([crops[0]] * 2, demo, 1.0, "a test", False, "arabic")
+    print("AI-corrected reading: prompt as tested, numbered answer parsed, falls back to the reading")
     print("all lens self-tests passed")
 
 

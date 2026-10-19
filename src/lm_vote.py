@@ -54,6 +54,7 @@ class KNLM:
 
     def __init__(self, counts, order=8, D=0.75):
         self.N, self.D = order, D
+        self.counts = counts
         self.count = [None] * (order + 1)
         self.count[order] = counts.raw[order]
         for k in range(1, order):
@@ -70,6 +71,36 @@ class KNLM:
     @classmethod
     def from_texts(cls, texts, order=8):
         return cls(Counts(texts, maxn=order), order=order)
+
+    def add_texts(self, texts, weight=3):
+        """
+        Learn from corrected lines on the spot: their n-grams are added to the
+        counts (raw counts weighted, so a correction outweighs one ordinary
+        training line), keeping every derived table consistent.
+        """
+        c, N = self.counts, self.N
+        for t in texts:
+            s = [BOS] * (c.maxn - 1) + list(t) + [EOS]
+            c.vocab.update(s)
+            for i in range(c.maxn - 1, len(s)):
+                for k in range(1, c.maxn + 1):
+                    key = (tuple(s[i - k + 1:i]), s[i])
+                    new_raw = c.raw[k][key] == 0
+                    c.raw[k][key] += weight
+                    if k == N:                                  # highest order: raw counts
+                        self.hist[N][key[0]] += weight
+                        if new_raw:
+                            self.types[N][key[0]] += 1
+                    if new_raw and 2 <= k <= N:                 # a new continuation for order k-1
+                        ck = (key[0][1:], key[1])
+                        new_cont = c.cont[k - 1][ck] == 0
+                        c.cont[k - 1][ck] += 1
+                        if k - 1 < N:
+                            self.hist[k - 1][ck[0]] += 1
+                            if new_cont:
+                                self.types[k - 1][ck[0]] += 1
+        self.V = len(c.vocab)
+        self.cache = {}
 
     def prob(self, h, c, k=None):
         k = self.N if k is None else k
@@ -158,6 +189,19 @@ def _self_test():
         allowed = set("".join(h.text for h in hyps))
         assert set(text) <= allowed, "the decoder may only choose proposed characters"
     print("lm_vote: lam 0 reproduces the vote on 200 cases; LM choices stay within the proposals")
+    # learning from a correction: the corrected name wins afterwards
+    lm2 = KNLM.from_texts(["الى بيت الشيخ موسى"] * 30, order=5)
+    hyps = [Hypothesis("a", "الشيخ يذبك", [0.9] * 10), Hypothesis("b", "الشيخ يزبك", [0.6] * 10),
+            Hypothesis("c", "الشيخ يذبك", [0.7] * 10)]
+    before, _ = lm_decode(hyps, lm2, lam=0.5, gap_bias=0.0)
+    lm2.add_texts(["بيت الشيخ يزبك"] * 2)
+    after, _ = lm_decode(hyps, lm2, lam=0.5, gap_bias=0.0)
+    assert before == "الشيخ يذبك" and after == "الشيخ يزبك", (before, after)
+    # incremental tables equal a rebuild from scratch
+    ref = KNLM.from_texts(["الى بيت الشيخ موسى"] * 30 + ["بيت الشيخ يزبك"] * 6, order=5)
+    for h, ch in [((BOS,) * 4, "ب"), (tuple("الشيخ")[-4:], " "), (tuple("ح يز")[-4:], "ب")]:
+        assert abs(ref.prob(h, ch) - lm2.prob(h, ch)) < 1e-9, (h, ch, ref.prob(h, ch), lm2.prob(h, ch))
+    print("lm_vote: a corrected word wins after learning; incremental update equals a rebuild")
 
 
 if __name__ == "__main__":
