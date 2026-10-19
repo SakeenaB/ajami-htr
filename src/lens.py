@@ -771,6 +771,9 @@ CSS = """
 .gradio-container .block { border-radius: 12px !important; box-shadow: 0 1px 3px rgba(16, 32, 63, .06); }
 #nq-read-btn { border-radius: 10px !important; min-height: 48px; font-weight: 600 !important; }
 #nq-teach { border-radius: 10px !important; }
+#nq-stop { border-radius: 10px !important; min-height: 48px; background: transparent !important;
+  border: 1px solid var(--nq-rule) !important; color: var(--nq-faded) !important; }
+#nq-stop:hover { border-color: var(--nq-gold) !important; color: var(--nq-gold) !important; }
 #nq-head .nq-lede { color: var(--nq-faded); }
 .nq-empty { padding: 28px 4px; color: var(--nq-faded); font-size: 1.08rem; line-height: 1.6; max-width: 46ch; }
 
@@ -833,6 +836,13 @@ def loading(stage="Reading the page…"):
 
 LOADING = loading()
 
+STOPPED = ('<div class="nq-empty">Stopped. Change what you need (the script, how to find the lines, or '
+           'the image) and read the page again.</div>')
+
+
+class Stopped(Exception):
+    """Raised at the next step boundary when the reader presses Stop."""
+
 EMPTY = ('<div class="nq-empty">Upload a photo or scan of a manuscript page, or of a single line, '
          'choose its script, and read the page. The transcription appears here, line by line.</div>')
 
@@ -851,6 +861,7 @@ def standalone_page(body):
 # Latin script and English (Ajami, experimental)
 # ---------------------------------------------------------------------------
 _NLLB = {}
+CANCEL = __import__('threading').Event()     # set by the Stop button
 
 
 def translate_lines(lines, src_lang="hau_Latn", device="cpu"):
@@ -1178,11 +1189,19 @@ def build_app(reader, kraken_bin):
             yield None, EMPTY, "", None, ""
             return
         stages, box = queue.Queue(), {}
+        CANCEL.clear()
+
+        def report(stage):
+            if CANCEL.is_set():
+                raise Stopped()
+            stages.put(stage)
 
         def work():
             try:
                 box["out"] = _run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models,
-                                  progress=stages.put)
+                                  progress=report)
+            except Stopped:
+                box["out"] = (None, STOPPED, "")
             except Exception as e:                       # noqa: BLE001
                 box["out"] = (None, f'<div class="nq-empty">Reading stopped with an error: '
                                     f'{html.escape(repr(e))}</div>', "")
@@ -1221,6 +1240,10 @@ def build_app(reader, kraken_bin):
         return (f"Learned from {n} corrected line{'s' if n != 1 else ''}. From now on, readings in this "
                 f"session prefer these words and spellings. Corrections are kept until the app restarts.")
 
+    def stop_now():
+        CANCEL.set()
+        return None, STOPPED, "", ""
+
     def _run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models, progress=None):
         if image is None:
             return None, EMPTY, ""
@@ -1258,7 +1281,9 @@ def build_app(reader, kraken_bin):
                 trans = _make(gr.Checkbox, value=False,
                               label="Also show an English translation, and for Ajami the Latin script "
                                     "(experimental, still being improved)")
-                go = _make(gr.Button, "Read the page", variant="primary", elem_id="nq-read-btn")
+                with gr.Row():
+                    go = _make(gr.Button, "Read the page", variant="primary", elem_id="nq-read-btn", scale=4)
+                    stop = _make(gr.Button, "Stop", variant="secondary", elem_id="nq-stop", scale=1)
                 with _make(gr.Accordion, "Advanced options", open=False):
                     lm_on = _make(gr.Checkbox, value=True,
                                   label="Enhanced reading (recommended). Untick to use the system exactly as it "
@@ -1282,9 +1307,13 @@ def build_app(reader, kraken_bin):
         inputs = [inp, script, mode, trans, lm_on, tidy, show]
         outputs = [boxed, out, txt, last, status]
         try:
-            go.click(run, inputs=inputs, outputs=outputs, show_progress="hidden")
+            reading = go.click(run, inputs=inputs, outputs=outputs, show_progress="hidden")
         except TypeError:                                    # an older Gradio without show_progress
-            go.click(run, inputs=inputs, outputs=outputs)
+            reading = go.click(run, inputs=inputs, outputs=outputs)
+        try:                                                 # Stop: cancel the reading and free the queue
+            stop.click(stop_now, outputs=[boxed, out, txt, status], cancels=[reading], queue=False)
+        except TypeError:
+            stop.click(stop_now, outputs=[boxed, out, txt, status])
         teach.click(learn, inputs=[txt, last], outputs=[status])
     return demo
 
@@ -1369,7 +1398,16 @@ def _self_test():
     assert seen[0] == "Preparing the image…" and seen[1] == "Finding the lines…" and \
         seen[2].startswith("Reading ") and seen[-1] == "Laying out the page…", seen
     assert "Preparing the image…" in loading("Preparing the image…")
-    print("page read end to end with a stand-in reader; HTML and boxed image rendered; stages reported in order")
+
+    def stop_at_reading(msg):
+        if msg.startswith("Reading "):
+            raise Stopped()
+    try:
+        read_page(FakeReader(), page, "projection", None, log=lambda *a: None, progress=stop_at_reading)
+        raise AssertionError("Stop was ignored")
+    except Stopped:
+        pass
+    print("page read end to end with a stand-in reader; HTML and boxed image rendered; stages reported in order; Stop ends a reading")
 
     # Arabic: four members in evaluation order, and the mirrored-scan output of
     # a --bidi-runs CRNN returned to logical order before the vote.
