@@ -690,7 +690,7 @@ def highlight(text, flags):
         k += 1
         while k < len(text) and unicodedata.category(text[k]).startswith("M"):
             k += 1
-        piece = html.escape(text[s:k]).replace(" ", "&nbsp;")
+        piece = html.escape(text[s:k])
         out.append(f'<span class="nq-unsure">{piece}</span>' if any(flags[s:k]) else piece)
     return "".join(out) or '<span class="nq-faint">Nothing was read on this line.</span>'
 
@@ -742,13 +742,21 @@ CSS = """
   box-shadow: 0 0 0 1px var(--nq-rule); background: #fff; }
 .nq-text { font-family: 'Scheherazade New', 'Amiri', 'Noto Naskh Arabic', serif; font-size: 1.95rem; line-height: 2.1;
   direction: rtl; text-align: right; margin: 6px 0 0; overflow: visible; white-space: normal;
-  overflow-wrap: anywhere; }
+  overflow-wrap: break-word; }
 .nq-unsure { color: var(--nq-gold); text-decoration: underline dotted var(--nq-gold);
   text-decoration-thickness: 3px; text-underline-offset: .45em; text-decoration-skip-ink: none; }
 .nq-models { display: grid; grid-template-columns: 4.5rem 1fr; gap: 0 10px; margin-top: 4px;
   align-items: baseline; font-size: .9rem; color: var(--nq-faded); }
 .nq-models .nq-text { font-size: 1.4rem; line-height: 1.9; margin: 0; color: var(--nq-faded); }
 .nq-faint { color: var(--nq-faded); font-style: italic; }
+.nq-enh { font-family: 'Scheherazade New', 'Amiri', 'Noto Naskh Arabic', serif; font-size: 1.75rem;
+  line-height: 2; direction: rtl; text-align: right; margin: 6px 0 0; color: var(--nq-ink);
+  border-right: 3px solid var(--nq-gold); padding-right: 12px; background: var(--nq-gold-wash);
+  border-radius: 6px 0 0 6px; white-space: normal; overflow-wrap: break-word; }
+.nq-enh-tag { font-family: 'Noto Sans', sans-serif; font-size: .72rem; letter-spacing: .03em;
+  color: #fff; background: var(--nq-gold); border-radius: 4px; padding: 1px 7px; margin-left: 10px;
+  vertical-align: middle; }
+.dark .nq-enh-tag { color: #0E1730; }
 .nq-boko { font-family: 'Gentium Book Plus', Georgia, serif; font-size: 1.15rem; line-height: 1.6;
   margin: 4px 0 0; direction: ltr; text-align: left; unicode-bidi: isolate; white-space: normal;
   color: var(--nq-ink); }
@@ -813,13 +821,15 @@ CSS = """
 def render_html(crops, results, seconds, method, show_models, script="ajami", use_lm=True):
     lang = PROFILES.get(script, PROFILES["ajami"])["lang"]
     n = len(results)
-    refined = sum(1 for r in results if r.get("machine_text") not in (None, r["text"]))
+    refined = sum(1 for r in results if r.get("enhanced") not in (None, r["text"]))
     parts = [f'<div class="nq-read"><p class="nq-summary">Read {n} line{"s" if n != 1 else ""} '
              f'in {seconds:.1f} seconds; lines found by {html.escape(method)}'
              f'{"" if use_lm else ", using the tested system only"}. A letter in blue with '
              f'dots beneath it means the recognisers disagreed about it: check those letters against '
              f'the manuscript.'
-             + (f' A final check refined {refined} of these lines.' if refined else '')
+             + (f' Beneath each line, <strong>Enhanced</strong> is the final, checked version ({refined} '
+                f'line{"s" if refined != 1 else ""} refined), with the letters it changed marked; the copy box '
+                f'holds the Enhanced lines.' if any(r.get("enhanced") for r in results) else '')
              + (' The English (and, for Ajami, the Latin script) is experimental and still being improved: '
                 'it is a machine translation of the reading, best read as a gist.'
                 if any(r.get("boko") or r.get("english") for r in results) else '')
@@ -832,6 +842,10 @@ def render_html(crops, results, seconds, method, show_models, script="ajami", us
                 f'<p class="nq-text" lang="{lang}">{html.escape(t).replace(" ", "&nbsp;") or "—"}</p>'
                 for name, t in r["models"].items()) + "</div>"
         extra = ""
+        if r.get("enhanced"):
+            changed = carry_flags(r["text"], [False] * len(r["text"]), r["enhanced"])
+            extra += (f'<p class="nq-enh" lang="{lang}" dir="rtl"><span class="nq-enh-tag">Enhanced</span>'
+                      f'{highlight(r["enhanced"], changed)}</p>')
         if r.get("boko"):
             extra += f'<p class="nq-boko" lang="ha" dir="ltr">{html.escape(r["boko"])}</p>'
         if r.get("english"):
@@ -930,9 +944,10 @@ def add_latin_and_english(results, device="cpu", log=print, english=True, script
         source, src_lang = "text", "apc_Arab"
     if not english:
         return results
-    todo = [k for k, r in enumerate(results) if r.get(source)]
+    pick = (lambda r: r.get("enhanced") or r.get("text")) if source == "text" else (lambda r: r.get(source))
+    todo = [k for k, r in enumerate(results) if pick(results[k])]
     try:
-        en = translate_lines([results[k][source] for k in todo], src_lang, device)
+        en = translate_lines([pick(results[k]) for k in todo], src_lang, device)
         for k, e in zip(todo, en):
             results[k]["english"] = e
     except Exception as e:                                # noqa: BLE001
@@ -1062,16 +1077,14 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
         t0 = time.time()
         say("Checking the reading…")
         add_ai_correction(results, log)
-        for r in results:                    # the checked reading becomes the reading
+        for r in results:                    # the checked line is shown as "Enhanced", beside the reading
             if r.get("ai"):
-                r["machine_text"] = r["text"]
-                r["unsure"] = carry_flags(r["text"], r["unsure"], r["ai"])
-                r["text"] = r.pop("ai")
-        changed = sum(1 for r in results if r.get("machine_text") not in (None, r["text"]))
+                r["enhanced"] = r.pop("ai")
+        changed = sum(1 for r in results if r.get("enhanced") not in (None, r["text"]))
         log(f"final check: {changed} of {len(results)} lines corrected")
         for k, r in enumerate(results[:3], 1):                 # the first lines, before and after
-            if r.get("machine_text") not in (None, r["text"]):
-                log(f"  line {k}: {r['machine_text']}  ->  {r['text']}")
+            if r.get("enhanced") not in (None, r["text"]):
+                log(f"  line {k}: {r['text']}  ->  {r['enhanced']}")
         timings["final check"] = time.time() - t0
     if translate:
         t0 = time.time()
@@ -1081,7 +1094,7 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
     seconds = time.time() - t_start
     say("Laying out the page…")
     log("timings: " + ", ".join(f"{k} {v:.1f}s" for k, v in timings.items()))
-    text = "\n".join(r["text"] for r in results)          # the copy box holds the reading only
+    text = "\n".join(r.get("enhanced") or r["text"] for r in results)   # the copy box: Enhanced lines
     return boxes, crops, results, seconds, method, text
 
 
@@ -1344,7 +1357,8 @@ def build_app(reader, kraken_bin):
                 boxed = _make(gr.Image, type="pil", label="Lines found", interactive=False)
             with gr.Column(scale=4):
                 out = gr.HTML(EMPTY)
-        txt = _make(gr.Textbox, label="The text: copy it, or correct it and teach Iʿjām", lines=8,
+        txt = _make(gr.Textbox, label="The text (Enhanced where available): copy it, or correct it and teach Iʿjām",
+                    lines=8,
                     rtl=True, interactive=True, show_copy_button=True, buttons=["copy"], elem_id="nq-copy")
         txt_en = _make(gr.Textbox, label="English translation, to copy (experimental)", lines=6,
                        interactive=False, visible=False, show_copy_button=True, buttons=["copy"],
@@ -1556,6 +1570,10 @@ def _self_test():
     assert parse_numbered("nothing useful", ["a", "b"]) == ["a", "b"]       # falls back to the reading
     f = carry_flags("الحديب لان", [False] * 6 + [True] * 4, "الحديث لان")
     assert f[5] is True and f[0] is False and f[6] is False and f[7:] == [True] * 3, f
+    demo[0]["enhanced"] = "الحديث لان للابنة"
+    page_html0 = render_html([crops[0]] * 2, demo, 1.0, "a test", False, "arabic")
+    assert 'class="nq-enh"' in page_html0 and ">Enhanced<" in page_html0 and "nq-unsure" in page_html0
+    del demo[0]["enhanced"]
     demo[0]["english"] = "the talk because the daughter"
     page_html = render_html([crops[0]] * 2, demo, 1.0, "a test", False, "arabic")
     assert 'dir="ltr"' in page_html and "nq-body" in page_html and "nq-ai" not in page_html
