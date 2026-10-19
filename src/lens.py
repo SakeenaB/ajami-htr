@@ -827,6 +827,8 @@ def render_html(crops, results, seconds, method, show_models, script="ajami", us
              f'{"" if use_lm else ", using the tested system only"}. A letter in blue with '
              f'dots beneath it means the recognisers disagreed about it: check those letters against '
              f'the manuscript.'
+             + (f' <strong>The final check could not run this time</strong> '
+                f'({html.escape(results[0]["check_note"])}).' if results and results[0].get("check_note") else '')
              + (f' Beneath each line, <strong>Enhanced</strong> is the final, checked version ({refined} '
                 f'line{"s" if refined != 1 else ""} refined), with the letters it changed marked; the copy box '
                 f'holds the Enhanced lines.' if any(r.get("enhanced") for r in results) else '')
@@ -1025,15 +1027,16 @@ def add_ai_correction(results, log=print):
         client = anthropic.Anthropic()
         request = dict(model=AI_MODEL, max_tokens=4000, system=system,
                        messages=[{"role": "user", "content": body}])
-        try:                                   # temperature 0: the same page gets the same check every time
+        try:                                   # ask for temperature 0 where the model allows it
             msg = client.messages.create(temperature=0, **request)
-        except anthropic.BadRequestError:      # a model that does not accept a temperature
+        except (TypeError, anthropic.BadRequestError):   # this model and library do not take one
             msg = client.messages.create(**request)
         text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
         for r, line in zip(results, parse_numbered(text, [r["text"] for r in results])):
             r["ai"] = line
     except Exception as e:                                # noqa: BLE001
         log(f"AI correction unavailable: {e!r}")
+        results[0]["check_note"] = f"{type(e).__name__}: {str(e)[:160]}"
     return results
 
 # ---------------------------------------------------------------------------
@@ -1073,6 +1076,8 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
         boxes, crops, results = tidy_results(boxes, crops, results)
     if ai and use_lm and script == "arabic" and not ai_available():
         log("final check skipped: no ANTHROPIC_API_KEY in the environment")
+        if results:
+            results[0]["check_note"] = "no API key was found when the app started"
     if ai and use_lm and script == "arabic" and ai_available():
         t0 = time.time()
         say("Checking the reading…")
@@ -1574,6 +1579,9 @@ def _self_test():
     page_html0 = render_html([crops[0]] * 2, demo, 1.0, "a test", False, "arabic")
     assert 'class="nq-enh"' in page_html0 and ">Enhanced<" in page_html0 and "nq-unsure" in page_html0
     del demo[0]["enhanced"]
+    demo[0]["check_note"] = "AuthenticationError: invalid x-api-key"
+    assert "could not run this time" in render_html([crops[0]] * 2, demo, 1.0, "t", False, "arabic")
+    del demo[0]["check_note"]
     demo[0]["english"] = "the talk because the daughter"
     page_html = render_html([crops[0]] * 2, demo, 1.0, "a test", False, "arabic")
     assert 'dir="ltr"' in page_html and "nq-body" in page_html and "nq-ai" not in page_html
