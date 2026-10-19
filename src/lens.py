@@ -811,11 +811,13 @@ CSS = """
 def render_html(crops, results, seconds, method, show_models, script="ajami", use_lm=True):
     lang = PROFILES.get(script, PROFILES["ajami"])["lang"]
     n = len(results)
+    refined = sum(1 for r in results if r.get("machine_text") not in (None, r["text"]))
     parts = [f'<div class="nq-read"><p class="nq-summary">Read {n} line{"s" if n != 1 else ""} '
              f'in {seconds:.1f} seconds; lines found by {html.escape(method)}'
              f'{"" if use_lm else ", using the tested system only"}. A letter in blue with '
              f'dots beneath it means the recognisers disagreed about it: check those letters against '
              f'the manuscript.'
+             + (f' A final check refined {refined} of these lines.' if refined else '')
              + (' The English (and, for Ajami, the Latin script) is experimental and still being improved: '
                 'it is a machine translation of the reading, best read as a gist.'
                 if any(r.get("boko") or r.get("english") for r in results) else '')
@@ -1048,6 +1050,8 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
     timings["recognition"] = time.time() - t0
     if tidy:
         boxes, crops, results = tidy_results(boxes, crops, results)
+    if ai and use_lm and script == "arabic" and not ai_available():
+        log("final check skipped: no ANTHROPIC_API_KEY in the environment")
     if ai and use_lm and script == "arabic" and ai_available():
         t0 = time.time()
         say("Checking the reading…")
@@ -1057,6 +1061,8 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
                 r["machine_text"] = r["text"]
                 r["unsure"] = carry_flags(r["text"], r["unsure"], r["ai"])
                 r["text"] = r.pop("ai")
+        changed = sum(1 for r in results if r.get("machine_text") not in (None, r["text"]))
+        log(f"final check: {changed} of {len(results)} lines corrected")
         timings["final check"] = time.time() - t0
     if translate:
         t0 = time.time()
@@ -1276,9 +1282,13 @@ def build_app(reader, kraken_bin):
             return None, EMPTY, "", ""
         script = scripts.get(script_label, "ajami")
         notes = []
+
+        def note(msg):                                       # kept, and shown in the server's output
+            notes.append(msg)
+            print(msg, flush=True)
         try:
             boxes, crops, results, secs, method, text = read_page(
-                reader, image, modes[mode_label], kraken_bin, log=notes.append, script=script,
+                reader, image, modes[mode_label], kraken_bin, log=note, script=script,
                 use_lm=bool(lm_on), tidy=bool(tidy_on), translate=bool(trans_on), ai=True,
                 progress=progress)
         except Exception as e:                              # noqa: BLE001
