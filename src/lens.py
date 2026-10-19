@@ -284,8 +284,8 @@ def group_rows(boxes, overlap=0.5):
     top to bottom.
 
     Safeguards: a box far taller than a typical line is a block, not a line,
-    and is dropped; a box narrower than a line is tall is a speck of dirt or
-    a stray mark, and is dropped; and only boxes of similar height are ever
+    and is dropped; a box much narrower than a line is tall (0.6 of it or less)
+    is a speck of dirt or a stray mark, and is dropped; and only boxes of similar height are ever
     merged, so no line can be swallowed by a larger box.
     """
     if not boxes:
@@ -293,7 +293,7 @@ def group_rows(boxes, overlap=0.5):
     heights = sorted(b[3] - b[1] for b in boxes)
     med = heights[len(heights) // 2]
     boxes = [b for b in boxes
-             if (b[3] - b[1]) <= 2.5 * med and (b[2] - b[0]) >= 0.8 * med]
+             if (b[3] - b[1]) <= 2.5 * med and (b[2] - b[0]) > 0.6 * med]    # keeps page numbers, short words
     rows = []
     for b in sorted(boxes, key=lambda b: (b[1] + b[3]) / 2):
         for r in rows:
@@ -414,11 +414,13 @@ def tidy_line(text, flags):
 
 
 def tidy_results(boxes, crops, results):
-    """Tidy every line and drop lines left with fewer than two letters."""
+    """Tidy every line; drop lines left with fewer than two letters, unless they are a number (a page number)."""
     kept = []
     for b, c, r in zip(boxes, crops, results):
         text, flags = tidy_line(r["text"], r["unsure"])
-        if sum(1 for ch in text if unicodedata.category(ch).startswith("L")) < 2:
+        letters = sum(1 for ch in text if unicodedata.category(ch).startswith("L"))
+        digits = sum(1 for ch in text if unicodedata.category(ch) == "Nd")
+        if letters < 2 and digits < 2:
             continue
         kept.append((b, c, dict(r, text=text, unsure=flags)))
     return [k[0] for k in kept], [k[1] for k in kept], [k[2] for k in kept]
@@ -1005,9 +1007,13 @@ def add_ai_correction(results, log=print):
     try:
         import anthropic
         system, body = ai_prompt(results)
-        msg = anthropic.Anthropic().messages.create(
-            model=AI_MODEL, max_tokens=4000, system=system,
-            messages=[{"role": "user", "content": body}])
+        client = anthropic.Anthropic()
+        request = dict(model=AI_MODEL, max_tokens=4000, system=system,
+                       messages=[{"role": "user", "content": body}])
+        try:                                   # temperature 0: the same page gets the same check every time
+            msg = client.messages.create(temperature=0, **request)
+        except anthropic.BadRequestError:      # a model that does not accept a temperature
+            msg = client.messages.create(**request)
         text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
         for r, line in zip(results, parse_numbered(text, [r["text"] for r in results])):
             r["ai"] = line
@@ -1063,6 +1069,9 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
                 r["text"] = r.pop("ai")
         changed = sum(1 for r in results if r.get("machine_text") not in (None, r["text"]))
         log(f"final check: {changed} of {len(results)} lines corrected")
+        for k, r in enumerate(results[:3], 1):                 # the first lines, before and after
+            if r.get("machine_text") not in (None, r["text"]):
+                log(f"  line {k}: {r['machine_text']}  ->  {r['text']}")
         timings["final check"] = time.time() - t0
     if translate:
         t0 = time.time()
@@ -1508,6 +1517,9 @@ def _self_test():
     print("enhanced reading: 16 weighted readings combine; only the four main readers are shown")
 
     # tidying: dots, Latin letters and lone letters go; real words and flags stay aligned
+    kept_b, _, kept_r = tidy_results([(0, 0, 9, 9)] * 3, [None] * 3,
+                                     [{"text": t, "unsure": [False] * len(t)} for t in ("١٠", "ن", "1 M .")])
+    assert [r["text"] for r in kept_r] == ["١٠"], [r["text"] for r in kept_r]     # a page number stays
     t, f = tidy_line("1 M . .. ..11", [False] * 13)
     assert sum(1 for ch in t if unicodedata.category(ch).startswith("L")) < 2
     sample = "عبود الى ن الخوري BL و طوبيا . . ."
