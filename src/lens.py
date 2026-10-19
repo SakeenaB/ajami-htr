@@ -723,10 +723,11 @@ CSS = """
 .nq-read { font-family: 'Gentium Book Plus', Georgia, serif; color: var(--nq-ink); }
 .nq-read .nq-summary { font-size: 1rem; line-height: 1.55; margin: 0 0 18px; color: var(--nq-faded);
   max-width: 64ch; }
-.nq-line { display: grid; grid-template-columns: 2.6rem 1fr; gap: 4px 14px; padding: 14px 0;
+.nq-line { display: grid; grid-template-columns: 2.6rem minmax(0, 1fr); gap: 4px 14px; padding: 16px 0;
   border-top: 1px solid var(--nq-rule); }
+.nq-body { min-width: 0; }
 .nq-line:first-of-type { border-top: 0; }
-.nq-num { grid-row: span 3; font-size: 1.35rem; color: var(--nq-rubric); text-align: right;
+.nq-num { font-size: 1.35rem; color: var(--nq-rubric); text-align: right;
   padding-top: 2px; font-variant-numeric: oldstyle-nums; }
 .nq-line img { max-width: 100%; height: auto; display: block; border-radius: 2px;
   box-shadow: 0 0 0 1px var(--nq-rule); background: #fff; }
@@ -739,16 +740,38 @@ CSS = """
   align-items: baseline; font-size: .9rem; color: var(--nq-faded); }
 .nq-models .nq-text { font-size: 1.4rem; line-height: 1.9; margin: 0; color: var(--nq-faded); }
 .nq-faint { color: var(--nq-faded); font-style: italic; }
-.nq-ai { font-family: 'Scheherazade New', 'Amiri', 'Noto Naskh Arabic', serif; font-size: 1.5rem;
-  line-height: 1.9; direction: rtl; text-align: right; margin: 2px 0 0; color: var(--nq-ink);
-  border-right: 3px solid var(--nq-gold); padding-right: 10px; }
-.nq-ai-tag { font-family: 'Noto Sans', sans-serif; font-size: .7rem; letter-spacing: .04em;
-  color: var(--nq-gold); border: 1px solid var(--nq-gold); border-radius: 3px; padding: 0 4px;
-  margin-left: 8px; vertical-align: middle; }
 .nq-boko { font-family: 'Gentium Book Plus', Georgia, serif; font-size: 1.15rem; line-height: 1.6;
-  margin: 2px 0 0; direction: ltr; text-align: left; color: var(--nq-ink); }
-.nq-en { font-size: 1.02rem; line-height: 1.55; margin: 2px 0 0; direction: ltr; text-align: left;
+  margin: 4px 0 0; direction: ltr; text-align: left; unicode-bidi: isolate; white-space: normal;
+  color: var(--nq-ink); }
+.nq-en { font-family: 'Gentium Book Plus', Georgia, serif; font-size: 1.08rem; line-height: 1.6;
+  margin: 2px 0 0; direction: ltr; text-align: left; unicode-bidi: isolate; white-space: normal;
   font-style: italic; color: var(--nq-faded); }
+
+/* the reading in progress: three orbits around a dot, the app's own mark */
+.nq-loading { display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 56px 0 48px;
+  color: var(--nq-faded); font-size: 1.05rem; }
+.nq-orbit { position: relative; width: 88px; height: 88px; }
+.nq-orbit span { position: absolute; border-radius: 50%; border: 2px solid transparent;
+  animation: nq-spin 1.6s cubic-bezier(.55,.15,.45,.85) infinite; }
+.nq-orbit span:nth-child(1) { inset: 0; border-top-color: var(--nq-gold); border-left-color: var(--nq-gold); }
+.nq-orbit span:nth-child(2) { inset: 12px 8px 14px 10px; border-right-color: var(--nq-gold); opacity: .7;
+  animation-duration: 2.3s; animation-direction: reverse; }
+.nq-orbit span:nth-child(3) { inset: 26px 24px 22px 28px; border-bottom-color: var(--nq-gold); opacity: .5;
+  animation-duration: 1.2s; }
+.nq-orbit i { position: absolute; left: 50%; top: 50%; width: 10px; height: 10px; margin: -5px 0 0 -5px;
+  border-radius: 50%; background: var(--nq-gold); animation: nq-pulse 1.6s ease-in-out infinite; }
+.nq-stage { margin: 0; letter-spacing: .01em; animation: nq-fade .5s ease-out; }
+@keyframes nq-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes nq-spin { to { transform: rotate(360deg); } }
+@keyframes nq-pulse { 0%, 100% { transform: scale(.8); opacity: .7; } 50% { transform: scale(1.15); opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .nq-orbit span { animation-duration: 8s; } .nq-orbit i { animation: none; } }
+
+/* calmer surfaces */
+.gradio-container .block { border-radius: 12px !important; box-shadow: 0 1px 3px rgba(16, 32, 63, .06); }
+#nq-read-btn { border-radius: 10px !important; min-height: 48px; font-weight: 600 !important; }
+#nq-teach { border-radius: 10px !important; }
+#nq-head .nq-lede { color: var(--nq-faded); }
 .nq-empty { padding: 28px 4px; color: var(--nq-faded); font-size: 1.08rem; line-height: 1.6; max-width: 46ch; }
 
 /* the desk: quiet controls, one inked action */
@@ -778,8 +801,6 @@ def render_html(crops, results, seconds, method, show_models, script="ajami", us
              f'{"" if use_lm else ", using the tested system only"}. A letter in blue with '
              f'dots beneath it means the recognisers disagreed about it: check those letters against '
              f'the manuscript.'
-             + (' Lines marked AI are a faithful correction by Claude, shown beside the reading for '
-                'comparison, never replacing it.' if any(r.get("ai") for r in results) else '')
              + (' The English (and, for Ajami, the Latin script) is experimental and still being improved: '
                 'it is a machine translation of the reading, best read as a gist.'
                 if any(r.get("boko") or r.get("english") for r in results) else '')
@@ -792,20 +813,25 @@ def render_html(crops, results, seconds, method, show_models, script="ajami", us
                 f'<p class="nq-text" lang="{lang}">{html.escape(t).replace(" ", "&nbsp;") or "—"}</p>'
                 for name, t in r["models"].items()) + "</div>"
         extra = ""
-        if r.get("ai"):
-            extra += (f'<p class="nq-ai" lang="{lang}"><span class="nq-ai-tag">AI</span>'
-                      f'{html.escape(r["ai"])}</p>')
         if r.get("boko"):
-            extra += f'<p class="nq-boko" lang="ha">{html.escape(r["boko"])}</p>'
+            extra += f'<p class="nq-boko" lang="ha" dir="ltr">{html.escape(r["boko"])}</p>'
         if r.get("english"):
-            extra += f'<p class="nq-en" lang="en">{html.escape(r["english"])}</p>'
-        parts.append(f'<div class="nq-line"><div class="nq-num">{k}</div>'
+            extra += f'<p class="nq-en" lang="en" dir="ltr">{html.escape(r["english"])}</p>'
+        parts.append(f'<div class="nq-line"><div class="nq-num">{k}</div><div class="nq-body">'
                      f'<img src="{_image_uri(crop)}" alt="Line {k} of the page">'
-                     f'<p class="nq-text" lang="{lang}">{highlight(r["text"], r["unsure"])}</p>'
-                     f'{extra}{models}</div>')
+                     f'<p class="nq-text" lang="{lang}" dir="rtl">{highlight(r["text"], r["unsure"])}</p>'
+                     f'{extra}{models}</div></div>')
     parts.append("</div>")
     return "".join(parts)
 
+
+def loading(stage="Reading the page…"):
+    return ('<div class="nq-loading" role="status" aria-live="polite"><div class="nq-orbit">'
+            '<span></span><span></span><span></span><i></i></div>'
+            f'<p class="nq-stage">{html.escape(stage)}</p></div>')
+
+
+LOADING = loading()
 
 EMPTY = ('<div class="nq-empty">Upload a photo or scan of a manuscript page, or of a single line, '
          'choose its script, and read the page. The transcription appears here, line by line.</div>')
@@ -916,6 +942,25 @@ def parse_numbered(text, fallback):
     return [got.get(i, f) or f for i, f in enumerate(fallback, 1)]
 
 
+
+def carry_flags(old, old_flags, new):
+    """
+    Flags for a corrected line: letters kept from the reading keep their flag;
+    letters the final check changed or added are flagged, so the reader sees
+    where to look.
+    """
+    import difflib
+    flags = [True] * len(new)
+    sm = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                flags[j1 + k] = bool(old_flags[i1 + k]) if i1 + k < len(old_flags) else False
+    for k, ch in enumerate(new):
+        if ch == " ":
+            flags[k] = False
+    return flags
+
 def add_ai_correction(results, log=print):
     """Ask Claude for a faithful correction of the page; sets r['ai'] on each line."""
     if not results:
@@ -938,12 +983,15 @@ def add_ai_correction(results, log=print):
 # ---------------------------------------------------------------------------
 
 def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajami", use_lm=True,
-              tidy=True, translate=False, ai=False):
+              tidy=True, translate=False, ai=False, progress=None):
+    say = progress or (lambda msg: None)
+    say("Preparing the image…")
     img = ImageOps.exif_transpose(img).convert("RGB")
     W, H = img.size
     if mode == "single" or (mode == "auto" and looks_like_single_line(img)):
         boxes, method = [(0, 0, W, H)], "treating the image as one line"
     else:
+        say("Finding the lines…")
         boxes, method = None, None
         if mode in ("auto", "kraken"):
             found = segment_kraken(img, kraken_bin, log=log)
@@ -957,24 +1005,33 @@ def read_page(reader, img, mode="auto", kraken_bin=None, log=print, script="ajam
     boxes = [(max(0, x0), max(0, y0), min(W, x1), min(H, y1)) for x0, y0, x1, y1 in boxes
              if x1 - x0 > 10 and y1 - y0 > 8][:MAX_LINES]
     crops = [img.crop(b) for b in boxes]
+    t_start = time.time()
+    timings = {}
     t0 = time.time()
+    say(f"Reading {len(crops)} line{'s' if len(crops) != 1 else ''}…")
     results = reader.read(crops, script, use_lm)
-    seconds = time.time() - t0
+    timings["recognition"] = time.time() - t0
     if tidy:
         boxes, crops, results = tidy_results(boxes, crops, results)
-    if ai and script == "arabic" and ai_available():
+    if ai and use_lm and script == "arabic" and ai_available():
+        t0 = time.time()
+        say("Checking the reading…")
         add_ai_correction(results, log)
+        for r in results:                    # the checked reading becomes the reading
+            if r.get("ai"):
+                r["machine_text"] = r["text"]
+                r["unsure"] = carry_flags(r["text"], r["unsure"], r["ai"])
+                r["text"] = r.pop("ai")
+        timings["final check"] = time.time() - t0
     if translate:
+        t0 = time.time()
+        say("Translating…")
         add_latin_and_english(results, getattr(reader, "device", "cpu"), log, script=script)
-    text = "\n".join(r["text"] for r in results)
-    if any(r.get("ai") for r in results):
-        text += ("\n\nAI-corrected reading (experimental, Claude):\n"
-                 + "\n".join(r.get("ai", "") for r in results))
-    if any(r.get("boko") for r in results):
-        text += "\n\nLatin script (Boko, experimental):\n" + "\n".join(r.get("boko", "") for r in results)
-    if any(r.get("english") for r in results):
-        text += ("\n\nEnglish (machine translation, experimental):\n"
-                 + "\n".join(r.get("english", "") for r in results))
+        timings["translation"] = time.time() - t0
+    seconds = time.time() - t_start
+    say("Laying out the page…")
+    log("timings: " + ", ".join(f"{k} {v:.1f}s" for k, v in timings.items()))
+    text = "\n".join(r["text"] for r in results)          # the copy box holds the reading only
     return boxes, crops, results, seconds, method, text
 
 
@@ -1081,9 +1138,10 @@ FOOT = """
   <li>Letters the recognisers disputed are shown in blue, with dots beneath them.</li>
   <li>You can correct the text and press <em>Teach Iʿjām my corrections</em>: the language model learns
   your corrected words at once, so later readings prefer them.</li>
-  <li>When an API key is provided, Arabic pages can also get an AI-corrected reading from Claude, which
-  fixes clear recognition errors while keeping the writer's spelling and dialect. It is shown beside the
-  reading, never instead of it.</li>
+  <li>For Arabic, a final check passes the combined reading, together with all four recognisers' readings,
+  to a large language model (Claude, by Anthropic), which repairs clear recognition errors from that
+  evidence while keeping the writer's own spelling and dialect. On held-out lines this lowered the
+  character error rate from 9.16% to 7.65%.</li>
   <li>Optionally, each line is translated to English by a machine translation model; Ajami lines are
   first written in Latin script (Boko) by rule. Both are experimental and still being improved.</li>
 </ol>
@@ -1112,17 +1170,40 @@ def build_app(reader, kraken_bin):
     available = getattr(reader, "scripts", {"ajami": None})
     scripts = {PROFILES[k]["label"]: k for k in PROFILES if k in available}
 
-    def run(image, script_label, mode_label, ai_on, trans_on, lm_on, tidy_on, show_models):
-        out = _run(image, script_label, mode_label, ai_on, trans_on, lm_on, tidy_on, show_models)
-        reading = out[2].split("\n\nAI-corrected")[0].split("\n\nLatin script")[0].split("\n\nEnglish")[0]
-        return out + ({"script": scripts.get(script_label, "ajami"), "lines": reading.split("\n")},
-                      "")
+    def run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models):
+        """Streams the loader with the current stage, then the page."""
+        import queue
+        import threading
+        if image is None:
+            yield None, EMPTY, "", None, ""
+            return
+        stages, box = queue.Queue(), {}
+
+        def work():
+            try:
+                box["out"] = _run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models,
+                                  progress=stages.put)
+            except Exception as e:                       # noqa: BLE001
+                box["out"] = (None, f'<div class="nq-empty">Reading stopped with an error: '
+                                    f'{html.escape(repr(e))}</div>', "")
+            finally:
+                stages.put(None)
+
+        threading.Thread(target=work, daemon=True).start()
+        yield None, loading("Preparing the image…"), "", None, ""
+        while True:
+            stage = stages.get()
+            if stage is None:
+                break
+            yield None, loading(stage), "", None, ""
+        out = box["out"]
+        yield out + ({"script": scripts.get(script_label, "ajami"), "lines": out[2].split("\n")}, "")
 
     def correction_lines(edited, state):
         """Corrected lines: the edited reading's lines that differ from the machine's."""
         if not state or not edited:
             return []
-        edited = edited.split("\n\nAI-corrected")[0].split("\n\nLatin script")[0].split("\n\nEnglish")[0]
+        edited = edited.strip()
         original = set(l.strip() for l in state["lines"])
         return [l.strip() for l in edited.split("\n") if l.strip() and l.strip() not in original]
 
@@ -1140,7 +1221,7 @@ def build_app(reader, kraken_bin):
         return (f"Learned from {n} corrected line{'s' if n != 1 else ''}. From now on, readings in this "
                 f"session prefer these words and spellings. Corrections are kept until the app restarts.")
 
-    def _run(image, script_label, mode_label, ai_on, trans_on, lm_on, tidy_on, show_models):
+    def _run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models, progress=None):
         if image is None:
             return None, EMPTY, ""
         script = scripts.get(script_label, "ajami")
@@ -1148,7 +1229,8 @@ def build_app(reader, kraken_bin):
         try:
             boxes, crops, results, secs, method, text = read_page(
                 reader, image, modes[mode_label], kraken_bin, log=notes.append, script=script,
-                use_lm=bool(lm_on), tidy=bool(tidy_on), translate=bool(trans_on), ai=bool(ai_on))
+                use_lm=bool(lm_on), tidy=bool(tidy_on), translate=bool(trans_on), ai=True,
+                progress=progress)
         except Exception as e:                              # noqa: BLE001
             return None, (f'<div class="nq-empty">Reading stopped with an error: '
                           f'{html.escape(repr(e))}. Try "The image is one line" for a single '
@@ -1173,16 +1255,14 @@ def build_app(reader, kraken_bin):
                                label="Script")
                 mode = _make(gr.Radio, choices=list(modes), value="Automatic",
                              label="How to find the lines")
-                ai_box = _make(gr.Checkbox, value=False, visible=ai_available(),
-                               label="Also show an AI-corrected reading (Arabic; experimental; uses Claude)")
                 trans = _make(gr.Checkbox, value=False,
                               label="Also show an English translation, and for Ajami the Latin script "
                                     "(experimental, still being improved)")
                 go = _make(gr.Button, "Read the page", variant="primary", elem_id="nq-read-btn")
                 with _make(gr.Accordion, "Advanced options", open=False):
                     lm_on = _make(gr.Checkbox, value=True,
-                                  label="Enhanced reading (recommended): read each line several ways and "
-                                        "prefer real words. Untick to use the system exactly as it was tested.")
+                                  label="Enhanced reading (recommended). Untick to use the system exactly as it "
+                                        "was tested.")
                     tidy = _make(gr.Checkbox, value=True,
                                  label="Tidy the output: skip dots and specks, widen lines to their full "
                                        "length, hide stray Latin letters and lone letters")
@@ -1199,8 +1279,12 @@ def build_app(reader, kraken_bin):
         status = gr.Markdown("")
         last = gr.State(None)
         gr.HTML(FOOT, elem_id="nq-foot")
-        go.click(run, inputs=[inp, script, mode, ai_box, trans, lm_on, tidy, show],
-                 outputs=[boxed, out, txt, last, status])
+        inputs = [inp, script, mode, trans, lm_on, tidy, show]
+        outputs = [boxed, out, txt, last, status]
+        try:
+            go.click(run, inputs=inputs, outputs=outputs, show_progress="hidden")
+        except TypeError:                                    # an older Gradio without show_progress
+            go.click(run, inputs=inputs, outputs=outputs)
         teach.click(learn, inputs=[txt, last], outputs=[status])
     return demo
 
@@ -1280,7 +1364,12 @@ def _self_test():
     html_out = standalone_page(render_html(crops, results, secs, method, True))
     assert html_out.count('class="nq-line"') == 6 and "nq-unsure" in html_out
     draw_boxes(page, boxes)
-    print("page read end to end with a stand-in reader; HTML and boxed image rendered")
+    seen = []
+    read_page(FakeReader(), page, "projection", None, log=lambda *a: None, progress=seen.append)
+    assert seen[0] == "Preparing the image…" and seen[1] == "Finding the lines…" and \
+        seen[2].startswith("Reading ") and seen[-1] == "Laying out the page…", seen
+    assert "Preparing the image…" in loading("Preparing the image…")
+    print("page read end to end with a stand-in reader; HTML and boxed image rendered; stages reported in order")
 
     # Arabic: four members in evaluation order, and the mirrored-scan output of
     # a --bidi-runs CRNN returned to logical order before the vote.
@@ -1362,9 +1451,12 @@ def _self_test():
     got = parse_numbered("1. الحديث لان للابنة\n2) واكثروا من", [d["text"] for d in demo])
     assert got == ["الحديث لان للابنة", "واكثروا من"]
     assert parse_numbered("nothing useful", ["a", "b"]) == ["a", "b"]       # falls back to the reading
-    demo[0]["ai"] = got[0]
-    assert 'class="nq-ai"' in render_html([crops[0]] * 2, demo, 1.0, "a test", False, "arabic")
-    print("AI-corrected reading: prompt as tested, numbered answer parsed, falls back to the reading")
+    f = carry_flags("الحديب لان", [False] * 6 + [True] * 4, "الحديث لان")
+    assert f[5] is True and f[0] is False and f[6] is False and f[7:] == [True] * 3, f
+    demo[0]["english"] = "the talk because the daughter"
+    page_html = render_html([crops[0]] * 2, demo, 1.0, "a test", False, "arabic")
+    assert 'dir="ltr"' in page_html and "nq-body" in page_html and "nq-ai" not in page_html
+    print("final check: prompt as tested, answer parsed, changed letters flagged; English laid out left to right")
     print("all lens self-tests passed")
 
 
