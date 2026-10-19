@@ -794,6 +794,8 @@ CSS = """
 #nq-read-btn::before { content: ""; display: inline-block; width: .55em; height: .55em;
   border-radius: 50%; background: currentColor; margin-right: .6em; vertical-align: .08em; }
 #nq-read-btn:focus-visible { outline: 3px solid var(--nq-gold) !important; outline-offset: 2px; }
+#nq-copy-en textarea { font-family: 'Gentium Book Plus', Georgia, serif !important;
+  font-size: 1.1rem !important; line-height: 1.6 !important; direction: ltr !important; text-align: left !important; }
 #nq-copy textarea { font-family: 'Scheherazade New', 'Amiri', 'Noto Naskh Arabic', serif !important;
   font-size: 1.55rem !important; line-height: 2 !important; }
 #nq-foot { font-size: .98rem; line-height: 1.6; color: var(--nq-faded); max-width: 70ch; }
@@ -1209,7 +1211,7 @@ def build_app(reader, kraken_bin):
         import queue
         import threading
         if image is None:
-            yield None, EMPTY, "", None, ""
+            yield None, EMPTY, "", gr.update(value="", visible=False), None, ""
             return
         stages, box = queue.Queue(), {}
         cancel = cancel_flag(request)
@@ -1225,7 +1227,7 @@ def build_app(reader, kraken_bin):
                 box["out"] = _run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models,
                                   progress=report)
             except Stopped:
-                box["out"] = (None, STOPPED, "")
+                box["out"] = (None, STOPPED, "", "")
             except Exception as e:                       # noqa: BLE001
                 box["out"] = (None, f'<div class="nq-empty">Reading stopped with an error: '
                                     f'{html.escape(repr(e))}</div>', "")
@@ -1233,14 +1235,15 @@ def build_app(reader, kraken_bin):
                 stages.put(None)
 
         threading.Thread(target=work, daemon=True).start()
-        yield None, loading("Preparing the image…"), "", None, ""
+        yield None, loading("Preparing the image…"), "", gr.update(value="", visible=False), None, ""
         while True:
             stage = stages.get()
             if stage is None:
                 break
-            yield None, loading(stage), "", None, ""
-        out = box["out"]
-        yield out + ({"script": scripts.get(script_label, "ajami"), "lines": out[2].split("\n")}, "")
+            yield None, loading(stage), "", gr.update(value="", visible=False), None, ""
+        image_out, body, text, english = box["out"]
+        yield (image_out, body, text, gr.update(value=english, visible=bool(english)),
+               {"script": scripts.get(script_label, "ajami"), "lines": text.split("\n")}, "")
 
     def correction_lines(edited, state):
         """Corrected lines: the edited reading's lines that differ from the machine's."""
@@ -1266,11 +1269,11 @@ def build_app(reader, kraken_bin):
 
     def stop_now(request: gr.Request = None):
         cancel_flag(request).set()                           # stops this browser's reading only
-        return None, STOPPED, "", ""
+        return None, STOPPED, "", gr.update(value="", visible=False), ""
 
     def _run(image, script_label, mode_label, trans_on, lm_on, tidy_on, show_models, progress=None):
         if image is None:
-            return None, EMPTY, ""
+            return None, EMPTY, "", ""
         script = scripts.get(script_label, "ajami")
         notes = []
         try:
@@ -1281,12 +1284,13 @@ def build_app(reader, kraken_bin):
         except Exception as e:                              # noqa: BLE001
             return None, (f'<div class="nq-empty">Reading stopped with an error: '
                           f'{html.escape(repr(e))}. Try "The image is one line" for a single '
-                          f'line, or crop the page to its text.</div>'), ""
+                          f'line, or crop the page to its text.</div>'), "", ""
         if not results:
             return image, ('<div class="nq-empty">No lines of text were found on this image. '
-                           'Crop it to the text, or choose "The image is one line".</div>'), ""
+                           'Crop it to the text, or choose "The image is one line".</div>'), "", ""
         body = render_html(crops, results, secs, method, show_models, script, bool(lm_on))
-        return draw_boxes(image, boxes), body, text
+        english = "\n".join(r.get("english", "") for r in results) if any(r.get("english") for r in results) else ""
+        return draw_boxes(image, boxes), body, text, english
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")          # Gradio 6: css and theme belong to launch()
@@ -1323,22 +1327,25 @@ def build_app(reader, kraken_bin):
                 out = gr.HTML(EMPTY)
         txt = _make(gr.Textbox, label="The text: copy it, or correct it and teach Iʿjām", lines=8,
                     rtl=True, interactive=True, show_copy_button=True, buttons=["copy"], elem_id="nq-copy")
+        txt_en = _make(gr.Textbox, label="English translation, to copy (experimental)", lines=6,
+                       interactive=False, visible=False, show_copy_button=True, buttons=["copy"],
+                       elem_id="nq-copy-en")
         with gr.Row():
             teach = _make(gr.Button, "Teach Iʿjām my corrections", variant="secondary", elem_id="nq-teach")
         status = gr.Markdown("")
         last = gr.State(None)
         gr.HTML(FOOT, elem_id="nq-foot")
         inputs = [inp, script, mode, trans, lm_on, tidy, show]
-        outputs = [boxed, out, txt, last, status]
+        outputs = [boxed, out, txt, txt_en, last, status]
         try:                                                 # up to three readers at once (phone + laptop)
             reading = go.click(run, inputs=inputs, outputs=outputs, show_progress="hidden",
                                concurrency_limit=3)
         except TypeError:                                    # an older Gradio
             reading = go.click(run, inputs=inputs, outputs=outputs)
         try:                                                 # Stop: cancel the reading and free the queue
-            stop.click(stop_now, outputs=[boxed, out, txt, status], cancels=[reading], queue=False)
+            stop.click(stop_now, outputs=[boxed, out, txt, txt_en, status], cancels=[reading], queue=False)
         except TypeError:
-            stop.click(stop_now, outputs=[boxed, out, txt, status])
+            stop.click(stop_now, outputs=[boxed, out, txt, txt_en, status])
         teach.click(learn, inputs=[txt, last], outputs=[status])
     try:
         demo.queue(default_concurrency_limit=3)
