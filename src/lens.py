@@ -314,8 +314,9 @@ def refine_boxes(img, boxes):
     Clean the segmenter's lines before reading them (display and reading only;
     the evaluated system was given its lines).
 
-      1. A box much shorter than a typical line is a dot, a stroke or a sliver
-         of a neighbouring line: drop it.
+      1. A box much shorter than a typical line that sits right against a line
+         is a dot, a stroke or a sliver of it: drop it. Standing alone (a page
+         number, a signature) it is kept.
       2. A box lying mostly inside another box is a fragment of that line:
          drop it.
       3. A box that stops short of the ink on its row is widened, left and
@@ -327,7 +328,20 @@ def refine_boxes(img, boxes):
         return []
     heights = sorted(b[3] - b[1] for b in boxes)
     med = max(8, heights[len(heights) // 2])
-    boxes = [b for b in boxes if (b[3] - b[1]) >= 0.45 * med]
+
+    def hugs_a_line(b):
+        """A short box within half a line height of a full-height line is a dot or a sliver of it."""
+        for o in boxes:
+            if o is b or (o[3] - o[1]) < 0.45 * med:
+                continue
+            gap = max(o[1] - b[3], b[1] - o[3], 0)          # vertical distance, 0 if they overlap
+            side = min(b[2], o[2] + med) - max(b[0], o[0] - med)   # horizontal overlap, with a margin
+            if gap <= 0.5 * med and side > 0:
+                return True
+        return False
+
+    # short boxes go only when they hug a line; standing alone (a page number, a signature) they stay
+    boxes = [b for b in boxes if (b[3] - b[1]) >= 0.45 * med or not hugs_a_line(b)]
 
     def area(b):
         return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
@@ -1017,27 +1031,68 @@ def carry_flags(old, old_flags, new):
             flags[k] = False
     return flags
 
-def add_ai_correction(results, log=print):
-    """Ask Claude for a faithful correction of the page; sets r['ai'] on each line."""
+def _check_once(system, body, n, fallback):
+    """One final-check request; returns the corrected lines (the reading where it gave none)."""
+    import anthropic
+    client = anthropic.Anthropic()
+    request = dict(model=AI_MODEL, max_tokens=4000, system=system,
+                   messages=[{"role": "user", "content": body}])
+    try:                                   # ask for temperature 0 where the model allows it
+        msg = client.messages.create(temperature=0, **request)
+    except (TypeError, anthropic.BadRequestError):   # this model and library do not take one
+        msg = client.messages.create(**request)
+    text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    return parse_numbered(text, fallback)
+
+
+def combine_checks(versions):
+    """
+    Several independent checks of one line, combined like the recognisers:
+    identical majority wins outright; otherwise a letter-by-letter vote over
+    the aligned versions, so a slip made by a single check is outvoted.
+    """
+    from collections import Counter
+    versions = [v for v in versions if v]
+    if not versions:
+        return ""
+    best, count = Counter(versions).most_common(1)[0]
+    if count * 2 > len(versions) or len(versions) == 1:
+        return best
+    hyps = [Hypothesis(f"check{k}", v, [0.9] * len(v)) for k, v in enumerate(versions)]
+    from alignment import build_network, vote
+    return vote(build_network(hyps))
+
+
+def add_ai_correction(results, log=print, checks=3):
+    """
+    The final check: `checks` independent requests to Claude run in parallel,
+    combined per line by vote (self-consistency), so one run's random slip
+    does not reach the reading. Sets r['ai'] on each line.
+    """
     if not results:
         return results
-    try:
-        import anthropic
-        system, body = ai_prompt(results)
-        client = anthropic.Anthropic()
-        request = dict(model=AI_MODEL, max_tokens=4000, system=system,
-                       messages=[{"role": "user", "content": body}])
-        try:                                   # ask for temperature 0 where the model allows it
-            msg = client.messages.create(temperature=0, **request)
-        except (TypeError, anthropic.BadRequestError):   # this model and library do not take one
-            msg = client.messages.create(**request)
-        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
-        for r, line in zip(results, parse_numbered(text, [r["text"] for r in results])):
-            r["ai"] = line
-    except Exception as e:                                # noqa: BLE001
+    from concurrent.futures import ThreadPoolExecutor
+    system, body = ai_prompt(results)
+    fallback = [r["text"] for r in results]
+    runs, errors = [], []
+    with ThreadPoolExecutor(checks) as ex:
+        futures = [ex.submit(_check_once, system, body, len(results), fallback) for _ in range(checks)]
+        for f in futures:
+            try:
+                runs.append(f.result())
+            except Exception as e:                        # noqa: BLE001
+                errors.append(e)
+    if not runs:
+        e = errors[0]
         log(f"AI correction unavailable: {e!r}")
         results[0]["check_note"] = f"{type(e).__name__}: {str(e)[:160]}"
+        return results
+    if errors:
+        log(f"final check: {len(errors)} of {checks} requests failed; combining the other {len(runs)}")
+    for k, r in enumerate(results):
+        r["ai"] = combine_checks([run[k] for run in runs]) or r["text"]
     return results
+
 
 # ---------------------------------------------------------------------------
 # one page, end to end
@@ -1551,9 +1606,18 @@ def _self_test():
     d = ImageDraw.Draw(page)
     d.rectangle([40, 60, 760, 90], fill=0)                  # one long line of "ink"
     d.ellipse([400, 150, 406, 156], fill=0)                 # a dot below it
-    got = refine_boxes(page.convert("RGB"), [(420, 50, 760, 100), (395, 145, 411, 160)])
-    assert len(got) == 1 and got[0][0] <= 45 and got[0][2] >= 755, got
-    print("tidying: dots, Latin and lone letters removed; a short box widened to its line; a dot box dropped")
+    got = refine_boxes(page.convert("RGB"), [(420, 50, 760, 100), (395, 105, 411, 120)])
+    assert len(got) == 1 and got[0][0] <= 45 and got[0][2] >= 755, got        # a dot hugging the line goes
+    page2 = Image.new("L", (800, 420), 255)
+    d2 = ImageDraw.Draw(page2)
+    for y in (40, 110, 180):
+        d2.rectangle([40, y + 10, 760, y + 40], fill=0)                      # three lines of "ink"
+    d2.ellipse([400, 232, 408, 240], fill=0)                                   # a dot just under the last
+    d2.rectangle([700, 330, 730, 350], fill=0)                                 # a page number, on its own
+    lines3 = [(40, 40, 760, 90), (40, 110, 760, 160), (40, 180, 760, 230)]
+    got = refine_boxes(page2.convert("RGB"), lines3 + [(395, 230, 411, 244), (695, 325, 735, 355)])
+    assert len(got) == 4 and got[-1][1] >= 320, got                           # dot gone, page number kept
+    print("tidying: dots, Latin and lone letters removed; a short box widened to its line; a dot box dropped; a page number kept")
     res = add_latin_and_english([{"text": "وَاڧَرْ إِࢽْڢِرَاجِ تَڢَرْکࣸو", "unsure": [False] * 28, "models": {}}],
                                 english=False)
     assert res[0]["boko"] == "waƙar infiraji ta farko", res[0]["boko"]
@@ -1585,7 +1649,10 @@ def _self_test():
     demo[0]["english"] = "the talk because the daughter"
     page_html = render_html([crops[0]] * 2, demo, 1.0, "a test", False, "arabic")
     assert 'dir="ltr"' in page_html and "nq-body" in page_html and "nq-ai" not in page_html
-    print("final check: prompt as tested, answer parsed, changed letters flagged; English laid out left to right")
+    assert combine_checks(["اسمعيني من", "السمعيني من", "اسمعيني من"]) == "اسمعيني من"
+    assert combine_checks(["اسمعيني تسحر", "السمعيني تسحر", "اسمعيني سحر"]) == "اسمعيني تسحر"
+    print("final check: prompt as tested, answer parsed, changed letters flagged; English laid out left to right; "
+          "three checks combined by vote")
     print("all lens self-tests passed")
 
 
