@@ -975,8 +975,13 @@ def translate_lines(lines, src_lang="hau_Latn", device="cpu"):
 
 def add_latin_and_english(results, device="cpu", log=print, english=True, script="ajami"):
     """
-    Ajami: Boko (rule-based, ajami2boko.py), then English from it.
-    Arabic: English directly from the reading.
+    Ajami: Latin script (Boko) and English. With an API key, Claude writes the
+    standard Latin spelling from the Ajami reading and a rough rule-based
+    transliteration, then translates (a Hausa speaker scored this 4.8/5 for
+    the Latin and 4.8/5 for the English on 30 held-out lines); without a key,
+    the rules and NLLB-200 are used.
+    Arabic: English from the Enhanced line (or the reading); Claude when a key
+    is present, otherwise NLLB-200.
     """
     if script == "ajami":
         from ajami2boko import to_boko
@@ -987,6 +992,16 @@ def add_latin_and_english(results, device="cpu", log=print, english=True, script
         source, src_lang = "text", "apc_Arab"
     if not english:
         return results
+    if ai_available():
+        try:
+            if script == "ajami":
+                latin_english_claude(results, log)
+            else:
+                english_claude(results, log)
+            if any(r.get("english") for r in results):
+                return results
+        except Exception as e:                            # noqa: BLE001
+            log(f"Claude translation unavailable, using NLLB: {e!r}")
     pick = (lambda r: r.get("enhanced") or r.get("text")) if source == "text" else (lambda r: r.get(source))
     todo = [k for k, r in enumerate(results) if pick(results[k])]
     try:
@@ -996,6 +1011,64 @@ def add_latin_and_english(results, device="cpu", log=print, english=True, script
     except Exception as e:                                # noqa: BLE001
         log(f"translation unavailable: {e!r}")
     return results
+
+
+# Claude for the Latin script and English (Ajami) and for English (Arabic).
+# The Ajami instructions are the ones a Hausa speaker reviewed (Latin 4.84/5,
+# English 4.78/5 on 30 held-out Infiraji lines).
+AJ_LATIN_SYSTEM = (
+    "You are an expert in Hausa and Fulfulde and in Ajami (these languages written in Arabic script). The lines "
+    "come, in order, from one page of a West African Ajami manuscript, in Hausa or Fulfulde; decide which from the "
+    "text. For each line you receive the machine's Ajami reading (it may contain recognition errors) and a rough, "
+    "letter-by-letter Latin transliteration made by rules, which often joins or splits words wrongly and may contain "
+    "spelling slips. For each line: (1) write it in the standard Latin spelling of that language (Boko for Hausa; "
+    "standard Fulfulde spelling), with correct word division and the letters ɓ, ɗ, ƙ, 'y, ƴ, ŋ or ñ where the "
+    "language needs them, writing Arabic phrases and names as that language writes them; stay faithful to the "
+    "Ajami and add no words or meaning that are not there; if a word is unclear, choose the closest real word to "
+    "the reading and mark it with (?). (2) Translate the line into natural English, faithful to the original; mark "
+    "uncertain parts with (?). Return exactly {n} lines, numbered '1.' to '{n}.', each in the form: Latin ||| English")
+
+AR_ENGLISH_SYSTEM = (
+    "You are an expert translator of handwritten Arabic letters and documents from Lebanon (19th to 21st century, "
+    "often in Lebanese colloquial Arabic). The lines come, in order, from one page. Translate each line into "
+    "natural English, faithful to the Arabic: keep names as names, do not add content, and mark unclear parts "
+    "with (?). Return exactly {n} lines, numbered '1.' to '{n}.', each containing only the English.")
+
+
+def _claude_text(system, body, max_tokens=4000):
+    import anthropic
+    msg = anthropic.Anthropic().messages.create(model=AI_MODEL, max_tokens=max_tokens, system=system,
+                                                messages=[{"role": "user", "content": body}])
+    return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+
+
+def parse_latin_english(text, n):
+    got = {}
+    for m in re.finditer(r"^\s*(\d+)\s*[.)]\s*(.*?)\s*\|\|\|\s*(.*)$", text, flags=re.M):
+        got[int(m.group(1))] = (m.group(2).strip(), m.group(3).strip())
+    return [got.get(i) for i in range(1, n + 1)]
+
+
+def latin_english_claude(results, log=print):
+    body = "\n".join(f"{i}. Ajami: {r['text']}\n   Rough Latin: {r.get('boko', '')}" for i, r in enumerate(results, 1))
+    out = parse_latin_english(_claude_text(AJ_LATIN_SYSTEM.format(n=len(results)), body), len(results))
+    got = 0
+    for r, o in zip(results, out):
+        if o and o[0]:
+            r["boko"], r["english"] = o[0], o[1]
+            got += 1
+    log(f"Latin and English by Claude: {got} of {len(results)} lines")
+
+
+def english_claude(results, log=print):
+    lines = [r.get("enhanced") or r["text"] for r in results]
+    body = "\n".join(f"{i}. {t}" for i, t in enumerate(lines, 1))
+    text = _claude_text(AR_ENGLISH_SYSTEM.format(n=len(lines)), body)
+    got = {int(m.group(1)): m.group(2).strip() for m in re.finditer(r"^\s*(\d+)\s*[.)]\s*(.*)$", text, flags=re.M)}
+    for i, r in enumerate(results, 1):
+        if got.get(i):
+            r["english"] = got[i]
+    log(f"English by Claude: {sum(1 for i in range(1, len(results) + 1) if got.get(i))} of {len(results)} lines")
 
 
 # ---------------------------------------------------------------------------
@@ -1297,8 +1370,10 @@ FOOT = """
   to a large language model (Claude, by Anthropic), which repairs clear recognition errors from that
   evidence while keeping the writer's own spelling and dialect. On held-out lines this lowered the
   character error rate from 9.16% to 7.65%.</li>
-  <li>Optionally, each line is translated to English by a machine translation model; Ajami lines are
-  first written in Latin script (Boko) by rule. Both are experimental and still being improved.</li>
+  <li>Optionally, each line is given in Latin script (for Ajami) and translated to English. With an API key,
+  a large language model (Claude) writes the standard Latin spelling from the reading and translates it; a Hausa
+  speaker scored this 4.8 out of 5 for both on held-out lines. Without a key, rules and the open NLLB-200
+  translation model are used. Both remain experimental: uncertain parts are marked with (?).</li>
 </ol>
 <p><strong>How well it reads.</strong> On manuscript lines held out from training it made fewer
 errors than the published systems: a character error rate of 10.42% on Ajami, where the published
@@ -1657,6 +1732,9 @@ def _self_test():
     assert split_white_bands(Image.new("RGB", (600, 300), (232, 220, 191))) is None   # a real page: no
     print("tidying: dots, Latin and lone letters removed; a short box widened to its line; a dot box dropped; "
           "a page number kept; a sheet of strips cut at its white gaps")
+    got = parse_latin_english("1. Mai sonsa ba zai baƙin ciki ba ||| Whoever loves him will not grieve\n2) Gobe ||| Tomorrow", 3)
+    assert got[0] == ("Mai sonsa ba zai baƙin ciki ba", "Whoever loves him will not grieve") and got[1][1] == "Tomorrow" and got[2] is None
+    assert "exactly 2 lines" in AJ_LATIN_SYSTEM.format(n=2) and "exactly 3 lines" in AR_ENGLISH_SYSTEM.format(n=3)
     res = add_latin_and_english([{"text": "وَاڧَرْ إِࢽْڢِرَاجِ تَڢَرْکࣸو", "unsure": [False] * 28, "models": {}}],
                                 english=False)
     assert res[0]["boko"] == "waƙar infiraji ta farko", res[0]["boko"]
